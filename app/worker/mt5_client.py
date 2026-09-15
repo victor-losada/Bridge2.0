@@ -17,6 +17,7 @@ from typing import Any, Sequence
 import psutil
 
 from app.utils import mt5_time_to_utc, to_iso_z, utc_now
+from app.worker import broker_directory
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +167,16 @@ class MT5Client:
         except Exception:
             pass
 
-        if not self._initialize_with_credentials(exe, login, password, server):
-            self._initialize_then_login(exe, login, password, server)
+        try:
+            if not self._initialize_with_credentials(exe, login, password, server):
+                self._initialize_then_login(exe, login, password, server)
+        except MT5AuthorizationError:
+            # Un `-6` no siempre es una contraseña mala: si el terminal no tiene
+            # a ese bróker en su lista de servidores, resuelve el nombre a otro
+            # sitio y ESE contesta "Invalid account". Se distingue preguntando
+            # la dirección al directorio y volviendo a intentarlo contra ella.
+            if not self._reintentar_por_direccion(exe, login, password, server):
+                raise
 
         info = mt5.account_info()
         if info is None:
@@ -181,6 +190,19 @@ class MT5Client:
                 f"Login inesperado: terminal={info.login} esperado={login}"
             )
 
+        # Al conectar por dirección hay que comprobar con QUIÉN se acabó
+        # hablando: el nombre canónico lo devuelve el propio servidor, y si no
+        # es el que pedimos, las credenciales del cliente han viajado a un sitio
+        # que no era. Mejor cortar que seguir.
+        esperado = server.strip()
+        real = str(getattr(info, "server", "") or "").strip()
+        if not broker_directory.parece_direccion(esperado) and real and real.lower() != esperado.lower():
+            mt5.shutdown()
+            raise MT5ConnectionError(
+                f"Servidor inesperado: se pidió {esperado!r} y el terminal está "
+                f"en {real!r}"
+            )
+
         self._connected = True
         logger.info(
             "conectado trade_mode=%s name=%s server=%s",
@@ -188,6 +210,30 @@ class MT5Client:
             info.name,
             info.server,
         )
+
+    def _reintentar_por_direccion(
+        self, exe: Path, login: int, password: str, server: str
+    ) -> bool:
+        """Reintenta contra la dirección real del bróker. True si entró.
+
+        Solo se prueba UN punto de acceso. Si la contraseña es de verdad mala,
+        insistir contra seis direcciones son seis logins fallidos seguidos, y
+        eso es lo que hace que un bróker bloquee la cuenta del cliente.
+        """
+        accesos = broker_directory.puntos_de_acceso(server)
+        if not accesos:
+            return False
+        destino = accesos[0]
+        logger.info(
+            "%s no estaba en la lista del terminal; reintentando por %s",
+            server,
+            destino,
+        )
+        try:
+            return self._initialize_with_credentials(exe, login, password, destino)
+        except MT5AuthorizationError:
+            # Rechazada también contra la dirección buena: son las credenciales.
+            return False
 
     def _initialize_with_credentials(
         self, exe: Path, login: int, password: str, server: str

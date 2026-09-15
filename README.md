@@ -384,6 +384,34 @@ no duplicar `trade.closed` si el Worker se reinicia. Dos reglas:
 Ante la duda siempre se empieza de cero. Repetir un trade lo resuelve el Core
 con su clave única (`bridge_position_id`); perderlo no lo resuelve nadie.
 
+### Un bróker que el terminal no conoce
+
+MT5 guarda los servidores que sabe resolver en `config/servers.dat`, y un slot
+hereda esa lista de la plantilla. Si el `mt5_server` que manda el Core no está
+ahí, el terminal **arranca y atiende el canal IPC con normalidad** pero nunca
+llega al servidor: `mt5.login()` expira con `-10005`.
+
+Eso se confunde fácilmente con otras dos cosas, y las tres se tratan distinto:
+
+| Tras reenganchar el IPC | Qué es | Qué hace el Worker |
+|---|---|---|
+| No reengancha | Canal roto | Reintenta: otro ciclo puede arreglarlo |
+| Reengancha, **nadie** dentro | Nunca alcanzó el servidor | `MT5ServerUnreachableError`, **no reintenta** |
+| Reengancha, **otra cuenta** dentro | El servidor sí respondió | Fallo normal, reintenta |
+
+El caso del medio llega al Core como `connection.status` con
+`broker_desconocido: ...` en vez de un error genérico.
+
+Dentro del bucle de login **no** se puede distinguir un servidor inalcanzable
+de un cambio de bróker lento —los dos dan `-10005` con el terminal vivo—, así
+que se le dan todos sus intentos antes de decidir. Lo que se corta es que el
+Worker repita el ciclo completo cuatro veces: eso pasaba de ~12 a ~50 minutos
+con el slot ocupado y sin decirle nada a nadie.
+
+Bajar de esos ~12 minutos exige saber que el servidor es desconocido **antes**
+de intentarlo, y eso depende de si la lista de servidores es transplantable
+entre terminales, que está sin verificar.
+
 ## 11. Qué falta antes de exponerlo a internet
 
 | | Por qué |

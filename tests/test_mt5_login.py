@@ -87,11 +87,24 @@ def test_credenciales_malas_no_se_reintentan(monkeypatch, tmp_path) -> None:
 
 
 def test_se_rinde_tras_agotar_los_intentos(monkeypatch, tmp_path) -> None:
+    """Se rinde tras N intentos, y dice POR QUÉ.
+
+    Este fixture es la firma exacta de un servidor inalcanzable: el IPC
+    reengancha y el terminal no llega a estar dentro de ninguna cuenta. Antes
+    devolvía un False mudo y el Worker repetía el ciclo entero cuatro veces
+    (~50 min con el slot ocupado). Ahora sale con una causa accionable.
+    """
+    from app.worker.mt5_client import MT5ServerUnreachableError
+
     fake = _FakeMT5(exitos_tras=99)
     monkeypatch.setattr(mt5_module, "mt5", fake)
     client = _cliente(tmp_path, login_attempts=3)
 
-    assert client._login_with_patience(_EXE, 203395, "x", "NYSMarketsLtd-trade") is False
+    with pytest.raises(MT5ServerUnreachableError):
+        client._login_with_patience(_EXE, 203395, "x", "NYSMarketsLtd-trade")
+
+    # Le da TODAS sus oportunidades antes de rendirse: un cambio de bróker
+    # lento es indistinguible de esto mientras ocurre.
     assert len(fake.intentos) == 3
 
 
@@ -225,3 +238,93 @@ def test_si_falla_reintenta_una_vez_tras_limpiar(monkeypatch, tmp_path) -> None:
         tmp_path / "terminal64.exe", 203395, "x", "S"
     ) is False
     assert fake.con_credenciales == 2  # lo intenta dos veces, no más
+
+
+# --- Bróker que el terminal no conoce ---------------------------------------
+#
+# Caso real: una cuenta de FTMO-Server4 en un pool cuya plantilla nunca vio
+# FTMO. El terminal arranca y atiende el IPC en 8 segundos, pero el login
+# contra ese servidor expira. Antes esto costaba ~50 minutos de reintentos
+# ciegos (4 ciclos de 12,4 min) con el slot ocupado y el Core sin saber nada.
+
+
+class _TerminalSanoQueNoEntra:
+    """El terminal responde, reengancha, pero nunca está en la cuenta."""
+
+    def __init__(self) -> None:
+        self.logins = 0
+        self.reenganches = 0
+
+    def login(self, **_kw) -> bool:
+        self.logins += 1
+        return False
+
+    def last_error(self):
+        return (-10005, "IPC timeout")
+
+    def account_info(self):
+        return None  # nadie dentro: nunca llegó al servidor
+
+    def shutdown(self):
+        pass
+
+
+def test_un_servidor_inalcanzable_no_se_reintenta_a_ciegas(monkeypatch) -> None:
+    """Si el IPC reengancha y el terminal no está dentro, insistir no informa."""
+    from pathlib import Path
+
+    from app.worker.mt5_client import MT5Client, MT5ServerUnreachableError
+
+    falso = _TerminalSanoQueNoEntra()
+    monkeypatch.setattr(mt5_module, "mt5", falso, raising=False)
+
+    cliente = MT5Client(terminal_path=Path("."))
+    cliente.login_attempts = 3
+    cliente.reattach_wait_sec = 0.0
+    monkeypatch.setattr(cliente, "_reattach", lambda _exe: True)   # IPC sano
+    monkeypatch.setattr(cliente, "_logged_as", lambda _login: False)  # pero fuera
+
+    with pytest.raises(MT5ServerUnreachableError) as err:
+        cliente._login_with_patience(Path("terminal64.exe"), 541446323, "x", "FTMO-Server4")
+
+    # Agota los 3 intentos: dentro del bucle NO se puede distinguir esto de un
+    # cambio de bróker en curso, así que se le da su margen completo. Lo que se
+    # corta es que el Worker repita el ciclo otras 4 veces.
+    assert falso.logins == 3
+    assert "FTMO-Server4" in str(err.value)
+
+
+def test_si_el_ipc_esta_roto_si_se_reintenta(monkeypatch) -> None:
+    """Un canal caído es otra cosa: ahí reintentar sí puede arreglarlo."""
+    from pathlib import Path
+
+    from app.worker.mt5_client import MT5Client
+
+    falso = _TerminalSanoQueNoEntra()
+    monkeypatch.setattr(mt5_module, "mt5", falso, raising=False)
+
+    cliente = MT5Client(terminal_path=Path("."))
+    cliente.login_attempts = 3
+    cliente.reattach_wait_sec = 0.0
+    monkeypatch.setattr(cliente, "_reattach", lambda _exe: False)  # canal roto
+
+    assert cliente._login_with_patience(Path("t.exe"), 1, "x", "S") is False
+    assert falso.logins == 3
+
+
+def test_el_terminal_que_ya_entro_se_da_por_bueno(monkeypatch) -> None:
+    """El corte de IPC al cambiar de bróker no puede confundirse con un fallo."""
+    from pathlib import Path
+
+    from app.worker.mt5_client import MT5Client
+
+    falso = _TerminalSanoQueNoEntra()
+    monkeypatch.setattr(mt5_module, "mt5", falso, raising=False)
+
+    cliente = MT5Client(terminal_path=Path("."))
+    cliente.login_attempts = 3
+    cliente.reattach_wait_sec = 0.0
+    monkeypatch.setattr(cliente, "_reattach", lambda _exe: True)
+    monkeypatch.setattr(cliente, "_logged_as", lambda _login: True)  # sí entró
+
+    assert cliente._login_with_patience(Path("t.exe"), 1, "x", "S") is True

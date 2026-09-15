@@ -43,6 +43,7 @@ from app.worker.event_emitter import EventEmitter
 from app.worker.mt5_client import (
     MT5Client,
     MT5ConnectionError,
+    MT5ServerUnreachableError,
     PositionSnapshot,
     position_to_event_dict,
 )
@@ -173,6 +174,14 @@ class Worker:
                 self._write_runtime("connected")
                 self._status("connected", "login ok")
                 return True
+            except MT5ServerUnreachableError as exc:
+                # Reintentar no puede cambiar el resultado, y cada ciclo cuesta
+                # más de diez minutos con el slot ocupado. Se corta aquí y el
+                # Core recibe una causa sobre la que puede actuar.
+                logger.error("servidor inalcanzable: %s", exc)
+                self._write_runtime("error")
+                self._status("error", f"broker_desconocido: {exc}")
+                return False
             except Exception as exc:
                 last_err = str(exc)
                 logger.warning("login intento %s/%s: %s", attempt, self.login_retry_max, exc)

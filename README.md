@@ -384,6 +384,31 @@ no duplicar `trade.closed` si el Worker se reinicia. Dos reglas:
 Ante la duda siempre se empieza de cero. Repetir un trade lo resuelve el Core
 con su clave única (`bridge_position_id`); perderlo no lo resuelve nadie.
 
+### Credenciales rechazadas: `-6`
+
+El `-6` de MT5 (`Terminal: Authorization failed`) **no es un timeout, es una
+respuesta**: el servidor del bróker contestó, en 1-2 segundos, que ese usuario
+y contraseña no valen. Llega al Core como `credenciales_rechazadas: ...` y **no
+se reintenta ni una vez**, por dos razones: el veredicto no va a cambiar, y
+repetir logins fallidos puede hacer que el bróker bloquee la cuenta.
+
+Va a ser el fallo más común según entren clientes, así que conviene saber
+distinguirlo de un `-10005` a simple vista:
+
+| Error | Cuánto tarda | Qué significa |
+|-------|--------------|---------------|
+| `-6` | 1-2 s | El servidor dijo que no: usuario, contraseña o servidor equivocados |
+| `-10005` | minutos | El canal con el terminal nunca estuvo listo |
+
+Si sospechas de unas credenciales, el camino rápido es `probe_slot --one-step`
+sobre un slot **limpio**: un slot con estado sucio de una ocupación anterior
+puede convertir un `-6` limpio en un `-10005` y mandarte a perseguir un
+problema de red que no existe.
+
+En PowerShell, las contraseñas van **entre comillas simples**. Con comillas
+dobles, todo lo que empiece por `$` se interpreta como una variable y se envía
+una contraseña distinta de la que escribiste.
+
 ### Un bróker que el terminal no conoce
 
 MT5 guarda los servidores que sabe resolver en `config/servers.dat`, y un slot

@@ -42,6 +42,7 @@ from app.worker import trade_candles
 from app.worker.event_emitter import EventEmitter
 from app.worker.mt5_client import (
     MT5Client,
+    MT5AuthorizationError,
     MT5ConnectionError,
     MT5ServerUnreachableError,
     PositionSnapshot,
@@ -174,6 +175,13 @@ class Worker:
                 self._write_runtime("connected")
                 self._status("connected", "login ok")
                 return True
+            except MT5AuthorizationError as exc:
+                # El servidor contestó que no. Reintentar no cambia el veredicto
+                # y arriesga que el bróker bloquee la cuenta.
+                logger.error("credenciales rechazadas: %s", exc)
+                self._write_runtime("error")
+                self._status("error", f"credenciales_rechazadas: {exc}")
+                return False
             except MT5ServerUnreachableError as exc:
                 # Reintentar no puede cambiar el resultado, y cada ciclo cuesta
                 # más de diez minutos con el slot ocupado. Se corta aquí y el

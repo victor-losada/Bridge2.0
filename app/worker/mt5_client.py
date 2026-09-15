@@ -20,6 +20,11 @@ from app.utils import mt5_time_to_utc, to_iso_z, utc_now
 
 logger = logging.getLogger(__name__)
 
+#: MT5: el servidor contestó y rechazó usuario/contraseña.
+AUTH_FAILED = -6
+#: MT5: el canal con el terminal no llegó a estar listo.
+IPC_TIMEOUT = -10005
+
 try:
     import MetaTrader5 as mt5  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - solo se instala en Windows con MT5
@@ -43,6 +48,19 @@ class MT5NotInstalledError(RuntimeError):
 
 class MT5ConnectionError(RuntimeError):
     pass
+
+
+class MT5AuthorizationError(MT5ConnectionError):
+    """El servidor del bróker rechazó las credenciales.
+
+    Es el `-6` de MT5, y es una respuesta, no un timeout: el servidor contestó
+    en menos de dos segundos. Repetirlo no puede cambiar el veredicto y encima
+    arriesga que el bróker bloquee la cuenta por intentos fallidos.
+
+    Merece su propio tipo porque a escala va a ser el fallo más común con
+    diferencia: un cliente que teclea mal su contraseña. Sin esto, cada error
+    de dedo costaba dos arranques, el camino largo y cuatro ciclos del Worker.
+    """
 
 
 class MT5ServerUnreachableError(MT5ConnectionError):
@@ -198,15 +216,24 @@ class MT5Client:
                 logger.info("mt5.initialize ok con credenciales (intento %s)", intento)
                 return True
 
+            err = mt5.last_error()
+            code = err[0] if isinstance(err, (tuple, list)) and err else None
             logger.warning(
                 "mt5.initialize con credenciales falló (intento %s): %s",
                 intento,
-                mt5.last_error(),
+                err,
             )
             try:
                 mt5.shutdown()
             except Exception:
                 pass
+            if code == AUTH_FAILED:
+                # El servidor ya ha contestado. Insistir no cambia nada y puede
+                # bloquear la cuenta.
+                raise MT5AuthorizationError(
+                    f"el servidor rechazó las credenciales de {login} en "
+                    f"{server!r}: {err}"
+                )
             if intento == 1:
                 # Un terminal de este slot colgado de un arranque anterior
                 # impide el attach: se limpia y se reintenta una vez.

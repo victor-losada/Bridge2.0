@@ -328,3 +328,55 @@ def test_el_terminal_que_ya_entro_se_da_por_bueno(monkeypatch) -> None:
     monkeypatch.setattr(cliente, "_logged_as", lambda _login: True)  # sí entró
 
     assert cliente._login_with_patience(Path("t.exe"), 1, "x", "S") is True
+
+
+# --- Credenciales rechazadas -------------------------------------------------
+#
+# Medido contra FTMO: el servidor contesta (-6, 'Terminal: Authorization
+# failed') en 1,3 s. Antes eso costaba dos arranques + el camino largo + cuatro
+# ciclos del Worker, ~50 min con el slot ocupado. Y a escala va a ser el fallo
+# más común: un cliente que teclea mal su contraseña.
+
+
+class _ServidorQueRechaza:
+    """El servidor responde, y dice que no."""
+
+    def __init__(self) -> None:
+        self.intentos = 0
+
+    def initialize(self, **_kw) -> bool:
+        self.intentos += 1
+        return False
+
+    def last_error(self):
+        return (-6, "Terminal: Authorization failed")
+
+    def shutdown(self):
+        pass
+
+
+def test_una_contrasena_rechazada_no_se_reintenta(monkeypatch, tmp_path) -> None:
+    from app.worker.mt5_client import MT5AuthorizationError
+
+    fake = _ServidorQueRechaza()
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    client = MT5Client(tmp_path)
+
+    with pytest.raises(MT5AuthorizationError) as err:
+        client._initialize_with_credentials(_EXE, 541446323, "mala", "FTMO-Server4")
+
+    assert fake.intentos == 1  # ni un segundo intento
+    assert "541446323" in str(err.value)
+    assert "FTMO-Server4" in str(err.value)
+
+
+def test_un_timeout_si_reintenta_tras_limpiar(monkeypatch, tmp_path) -> None:
+    """Un -10005 es otra cosa: puede ser un terminal colgado del ciclo anterior."""
+    fake = _FakeMT5UnPaso(acepta_un_paso=False)
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    client = MT5Client(tmp_path)
+
+    assert client._initialize_with_credentials(_EXE, 203395, "x", "S") is False
+    assert fake.con_credenciales == 2

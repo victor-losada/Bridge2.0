@@ -45,6 +45,22 @@ class MT5ConnectionError(RuntimeError):
     pass
 
 
+class MT5ServerUnreachableError(MT5ConnectionError):
+    """El terminal está sano pero no consigue entrar en ESE servidor.
+
+    Se distingue del resto de fallos de conexión porque reintentar no cambia
+    nada: el terminal atiende el canal IPC, arranca y responde, y aun así el
+    login contra ese servidor expira. El caso típico es un bróker que no está
+    en la lista de servidores del terminal (`config/servers.dat`): sin la
+    dirección del servidor no hay a dónde conectar, y eso no mejora por
+    insistir.
+
+    Existe para cortar la hemorragia: sin esta distinción, un bróker
+    desconocido consumía ~50 minutos de reintentos ciegos con el slot ocupado
+    y el Core sin saber por qué.
+    """
+
+
 @dataclass(slots=True)
 class PositionSnapshot:
     ticket: int
@@ -257,6 +273,14 @@ class MT5Client:
         pedida, el login había funcionado. Un fallo de credenciales no se
         reintenta — repetirlo solo arriesga bloquear la cuenta.
         """
+        # Tres cosas distintas producen -10005, y solo una justifica rendirse:
+        #   IPC no reengancha        -> canal roto, otro ciclo puede arreglarlo
+        #   reengancha, nadie dentro -> nunca llegó al servidor: inalcanzable
+        #   reengancha, otra cuenta  -> el servidor SÍ respondió; fallo normal
+        solo_ipc_timeout = True
+        ipc_sano = False
+        vio_alguna_cuenta = False
+
         for attempt in range(1, self.login_attempts + 1):
             if mt5.login(
                 login=int(login),
@@ -268,6 +292,7 @@ class MT5Client:
 
             err = mt5.last_error()
             code = err[0] if isinstance(err, (tuple, list)) and err else None
+            solo_ipc_timeout = solo_ipc_timeout and code == -10005
             logger.warning(
                 "mt5.login intento %s/%s: %s", attempt, self.login_attempts, err
             )
@@ -283,9 +308,24 @@ class MT5Client:
             time.sleep(self.reattach_wait_sec)
             if not self._reattach(exe):
                 continue
+            ipc_sano = True
             if self._logged_as(login):
                 logger.info("el terminal ya está dentro de la cuenta %s", login)
                 return True
+            if mt5.account_info() is not None:
+                vio_alguna_cuenta = True
+
+        # Agotados los intentos. Si el canal reenganchaba y aun así el terminal
+        # nunca llegó a estar dentro de NINGUNA cuenta, no es lentitud del
+        # cambio de bróker: el terminal no alcanza ese servidor. Repetir el
+        # ciclo entero cuesta doce minutos y no puede descubrir nada nuevo.
+        if solo_ipc_timeout and ipc_sano and not vio_alguna_cuenta:
+            raise MT5ServerUnreachableError(
+                f"el terminal responde pero no alcanza {server!r} "
+                f"(login {login}) tras {self.login_attempts} intentos. Lo "
+                f"habitual es que ese bróker no esté en la lista de servidores "
+                f"de este terminal."
+            )
         return False
 
     def _reattach(self, exe: Path) -> bool:

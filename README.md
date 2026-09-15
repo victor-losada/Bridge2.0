@@ -419,8 +419,18 @@ ahí, así que el terminal resuelve el nombre a otro sitio y **ese** contesta
 `Invalid account` — que suena a credenciales y no lo es. Desde Python los dos
 casos son el mismo `-6`.
 
+Y se presenta de **dos formas distintas** según el estado del slot, que es lo
+que más despista:
+
+| Estado del slot | Qué error da |
+|-----------------|--------------|
+| Limpio | `-6` — el nombre resuelve a otro sitio y ese contesta |
+| Viene de otra cuenta | `-10005` — el terminal ni llega a atender el canal |
+
+Son el mismo problema, así que el rescate se dispara en los dos casos.
+
 La salida está en que MetaQuotes documenta que el parámetro `server` admite
-**`dirección:puerto`** además del nombre. Así que ante un `-6` el Worker
+**`dirección:puerto`** además del nombre. Así que ante un fallo el Worker
 pregunta la dirección al directorio público de brókers —el mismo que consulta
 el botón "Buscar tu bróker" del terminal— y lo reintenta contra ella:
 
@@ -441,6 +451,8 @@ Tres decisiones que no son obvias:
 - **Se comprueba con quién se acabó hablando.** Tras conectar por dirección, si
   `account_info().server` no es el nombre que se pidió, se corta: las
   credenciales del cliente habrían viajado a un sitio que no era.
+- **La dirección se prueba ANTES del camino largo**, porque cuesta segundos y
+  el rodeo en dos pasos cuesta diez minutos.
 
 Si el directorio no responde, no pasa nada: se devuelve el error original y
 una conexión que funcionaba por su nombre sigue funcionando.

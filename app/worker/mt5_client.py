@@ -167,16 +167,22 @@ class MT5Client:
         except Exception:
             pass
 
+        # Un bróker que no está en la lista del terminal se presenta de dos
+        # formas según el estado del slot: en uno limpio, el nombre resuelve a
+        # otro sitio y ESE contesta -6; en uno que viene de otra cuenta, el
+        # terminal ni llega a atender el canal y da -10005. Son el mismo
+        # problema, así que la dirección real se prueba en los dos casos, y
+        # antes del camino largo porque cuesta segundos en vez de minutos.
         try:
-            if not self._initialize_with_credentials(exe, login, password, server):
-                self._initialize_then_login(exe, login, password, server)
+            ok = self._initialize_with_credentials(exe, login, password, server)
         except MT5AuthorizationError:
-            # Un `-6` no siempre es una contraseña mala: si el terminal no tiene
-            # a ese bróker en su lista de servidores, resuelve el nombre a otro
-            # sitio y ESE contesta "Invalid account". Se distingue preguntando
-            # la dirección al directorio y volviendo a intentarlo contra ella.
             if not self._reintentar_por_direccion(exe, login, password, server):
                 raise
+        else:
+            if not ok and not self._reintentar_por_direccion(
+                exe, login, password, server
+            ):
+                self._initialize_then_login(exe, login, password, server)
 
         info = mt5.account_info()
         if info is None:
@@ -219,6 +225,10 @@ class MT5Client:
         Solo se prueba UN punto de acceso. Si la contraseña es de verdad mala,
         insistir contra seis direcciones son seis logins fallidos seguidos, y
         eso es lo que hace que un bróker bloquee la cuenta del cliente.
+
+        Un -6 contra la dirección BUENA sí es concluyente —el servidor correcto
+        ha dicho que no— así que se deja propagar en vez de tragarlo: ahorra el
+        rodeo de diez minutos del camino largo.
         """
         accesos = broker_directory.puntos_de_acceso(server)
         if not accesos:
@@ -229,11 +239,7 @@ class MT5Client:
             server,
             destino,
         )
-        try:
-            return self._initialize_with_credentials(exe, login, password, destino)
-        except MT5AuthorizationError:
-            # Rechazada también contra la dirección buena: son las credenciales.
-            return False
+        return self._initialize_with_credentials(exe, login, password, destino)
 
     def _initialize_with_credentials(
         self, exe: Path, login: int, password: str, server: str

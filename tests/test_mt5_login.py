@@ -328,3 +328,169 @@ def test_el_terminal_que_ya_entro_se_da_por_bueno(monkeypatch) -> None:
     monkeypatch.setattr(cliente, "_logged_as", lambda _login: True)  # sí entró
 
     assert cliente._login_with_patience(Path("t.exe"), 1, "x", "S") is True
+
+
+# --- Credenciales rechazadas -------------------------------------------------
+#
+# Medido contra FTMO: el servidor contesta (-6, 'Terminal: Authorization
+# failed') en 1,3 s. Antes eso costaba dos arranques + el camino largo + cuatro
+# ciclos del Worker, ~50 min con el slot ocupado. Y a escala va a ser el fallo
+# más común: un cliente que teclea mal su contraseña.
+
+
+class _ServidorQueRechaza:
+    """El servidor responde, y dice que no."""
+
+    def __init__(self) -> None:
+        self.intentos = 0
+
+    def initialize(self, **_kw) -> bool:
+        self.intentos += 1
+        return False
+
+    def last_error(self):
+        return (-6, "Terminal: Authorization failed")
+
+    def shutdown(self):
+        pass
+
+
+def test_una_contrasena_rechazada_no_se_reintenta(monkeypatch, tmp_path) -> None:
+    from app.worker.mt5_client import MT5AuthorizationError
+
+    fake = _ServidorQueRechaza()
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    client = MT5Client(tmp_path)
+
+    with pytest.raises(MT5AuthorizationError) as err:
+        client._initialize_with_credentials(_EXE, 541446323, "mala", "FTMO-Server4")
+
+    assert fake.intentos == 1  # ni un segundo intento
+    assert "541446323" in str(err.value)
+    assert "FTMO-Server4" in str(err.value)
+
+
+def test_un_timeout_si_reintenta_tras_limpiar(monkeypatch, tmp_path) -> None:
+    """Un -10005 es otra cosa: puede ser un terminal colgado del ciclo anterior."""
+    fake = _FakeMT5UnPaso(acepta_un_paso=False)
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    client = MT5Client(tmp_path)
+
+    assert client._initialize_with_credentials(_EXE, 203395, "x", "S") is False
+    assert fake.con_credenciales == 2
+
+
+# --- Bróker que no está en la lista del terminal ------------------------------
+#
+# El caso real de FTMO: el terminal resuelve 'FTMO-Server4' a otro sitio y ESE
+# contesta 'Invalid account'. Indistinguible de una contraseña mala desde
+# Python: los dos son -6. Se resuelve preguntando la dirección al directorio.
+
+
+class _ServidorQueSoloAceptaLaDireccion:
+    """Rechaza el nombre y acepta la dirección: el bróker no está en la lista."""
+
+    DIRECCION = "35.234.132.67:443"
+
+    def __init__(self, login_real: int = 541446323) -> None:
+        self.login_real = login_real
+        self.servidores_probados: list[str] = []
+
+    def initialize(self, path=None, timeout=None, portable=None, **kw):
+        self.servidores_probados.append(kw.get("server", ""))
+        return kw.get("server") == self.DIRECCION
+
+    def last_error(self):
+        return (-6, "Terminal: Authorization failed")
+
+    def shutdown(self):
+        pass
+
+    def account_info(self):
+        cuenta = _CuentaMT5(self.login_real)
+        cuenta.server = "FTMO-Server4"  # el nombre canónico lo da el servidor
+        cuenta.name = "Prueba"
+        return cuenta
+
+
+def test_un_broker_fuera_de_la_lista_se_resuelve_por_direccion(monkeypatch, tmp_path) -> None:
+    fake = _ServidorQueSoloAceptaLaDireccion()
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    monkeypatch.setattr(
+        mt5_module.broker_directory,
+        "puntos_de_acceso",
+        lambda nombre, **kw: [_ServidorQueSoloAceptaLaDireccion.DIRECCION],
+    )
+    (tmp_path / "terminal64.exe").write_text("exe")
+    client = MT5Client(tmp_path)
+
+    client.initialize_and_login(541446323, "buena", "FTMO-Server4")
+
+    assert fake.servidores_probados == [
+        "FTMO-Server4",
+        _ServidorQueSoloAceptaLaDireccion.DIRECCION,
+    ]
+
+
+def test_solo_se_prueba_una_direccion(monkeypatch, tmp_path) -> None:
+    """Seis logins fallidos seguidos es como un bróker bloquea una cuenta."""
+    fake = _ServidorQueSoloAceptaLaDireccion()
+    fake.DIRECCION = "no-coincide:443"  # nada funcionará
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    monkeypatch.setattr(
+        mt5_module.broker_directory,
+        "puntos_de_acceso",
+        lambda nombre, **kw: ["1.1.1.1:443", "2.2.2.2:443", "3.3.3.3:443"],
+    )
+    (tmp_path / "terminal64.exe").write_text("exe")
+    client = MT5Client(tmp_path)
+
+    with pytest.raises(mt5_module.MT5AuthorizationError):
+        client.initialize_and_login(541446323, "mala", "FTMO-Server4")
+
+    assert fake.servidores_probados == ["FTMO-Server4", "1.1.1.1:443"]
+
+
+def test_si_el_directorio_no_sabe_nada_gana_el_error_original(monkeypatch, tmp_path) -> None:
+    fake = _ServidorQueSoloAceptaLaDireccion()
+    fake.DIRECCION = "no-coincide:443"
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    monkeypatch.setattr(
+        mt5_module.broker_directory, "puntos_de_acceso", lambda nombre, **kw: []
+    )
+    (tmp_path / "terminal64.exe").write_text("exe")
+    client = MT5Client(tmp_path)
+
+    with pytest.raises(mt5_module.MT5AuthorizationError):
+        client.initialize_and_login(541446323, "mala", "FTMO-Server4")
+
+    assert fake.servidores_probados == ["FTMO-Server4"]
+
+
+def test_conectar_a_otro_servidor_del_mismo_broker_se_corta(monkeypatch, tmp_path) -> None:
+    """Si acabamos en FTMO-Server3 pidiendo el 4, las credenciales del cliente
+    han viajado a un sitio que no era. Cortar, no seguir."""
+
+    class _OtroServidor(_ServidorQueSoloAceptaLaDireccion):
+        def initialize(self, path=None, timeout=None, portable=None, **kw):
+            self.servidores_probados.append(kw.get("server", ""))
+            return True
+
+        def account_info(self):
+            cuenta = _CuentaMT5(self.login_real)
+            cuenta.server = "FTMO-Server3"  # no es el que se pidió
+            cuenta.name = "Prueba"
+            return cuenta
+
+    fake = _OtroServidor()
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    (tmp_path / "terminal64.exe").write_text("exe")
+    client = MT5Client(tmp_path)
+
+    with pytest.raises(mt5_module.MT5ConnectionError, match="Servidor inesperado"):
+        client.initialize_and_login(541446323, "buena", "FTMO-Server4")

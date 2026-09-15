@@ -384,12 +384,71 @@ no duplicar `trade.closed` si el Worker se reinicia. Dos reglas:
 Ante la duda siempre se empieza de cero. Repetir un trade lo resuelve el Core
 con su clave única (`bridge_position_id`); perderlo no lo resuelve nadie.
 
+### Credenciales rechazadas: `-6`
+
+El `-6` de MT5 (`Terminal: Authorization failed`) **no es un timeout, es una
+respuesta**: el servidor del bróker contestó, en 1-2 segundos, que ese usuario
+y contraseña no valen. Llega al Core como `credenciales_rechazadas: ...` y **no
+se reintenta ni una vez**, por dos razones: el veredicto no va a cambiar, y
+repetir logins fallidos puede hacer que el bróker bloquee la cuenta.
+
+Va a ser el fallo más común según entren clientes, así que conviene saber
+distinguirlo de un `-10005` a simple vista:
+
+| Error | Cuánto tarda | Qué significa |
+|-------|--------------|---------------|
+| `-6` | 1-2 s | El servidor dijo que no: usuario, contraseña o servidor equivocados |
+| `-10005` | minutos | El canal con el terminal nunca estuvo listo |
+
+Si sospechas de unas credenciales, el camino rápido es `probe_slot --one-step`
+sobre un slot **limpio**: un slot con estado sucio de una ocupación anterior
+puede convertir un `-6` limpio en un `-10005` y mandarte a perseguir un
+problema de red que no existe.
+
+En PowerShell, las contraseñas van **entre comillas simples**. Con comillas
+dobles, todo lo que empiece por `$` se interpreta como una variable y se envía
+una contraseña distinta de la que escribiste.
+
 ### Un bróker que el terminal no conoce
 
+**Se resuelve solo. No hay que dar de alta brókers a mano.**
+
 MT5 guarda los servidores que sabe resolver en `config/servers.dat`, y un slot
-hereda esa lista de la plantilla. Si el `mt5_server` que manda el Core no está
-ahí, el terminal **arranca y atiende el canal IPC con normalidad** pero nunca
-llega al servidor: `mt5.login()` expira con `-10005`.
+hereda esa lista de la plantilla. Un bróker que la plantilla nunca vio no está
+ahí, así que el terminal resuelve el nombre a otro sitio y **ese** contesta
+`Invalid account` — que suena a credenciales y no lo es. Desde Python los dos
+casos son el mismo `-6`.
+
+La salida está en que MetaQuotes documenta que el parámetro `server` admite
+**`dirección:puerto`** además del nombre. Así que ante un `-6` el Worker
+pregunta la dirección al directorio público de brókers —el mismo que consulta
+el botón "Buscar tu bróker" del terminal— y lo reintenta contra ella:
+
+```
+initialize(server='FTMO-Server4')       -> -6 Authorization failed
+  directorio: FTMO-Server4 -> 35.234.132.67:443
+initialize(server='35.234.132.67:443')  -> True en 2,9 s
+  account_info().server == 'FTMO-Server4'
+```
+
+Tres decisiones que no son obvias:
+
+- **Solo se prueba UN punto de acceso.** El directorio devuelve seis; probarlos
+  todos con una contraseña mala son seis logins fallidos seguidos, que es
+  justo como un bróker bloquea la cuenta de un cliente.
+- **La coincidencia del nombre es exacta.** Buscar `FTMO-Server4` devuelve
+  también el 3 y el 5, y conectar al que no es da el mismo `Invalid account`.
+- **Se comprueba con quién se acabó hablando.** Tras conectar por dirección, si
+  `account_info().server` no es el nombre que se pidió, se corta: las
+  credenciales del cliente habrían viajado a un sitio que no era.
+
+Si el directorio no responde, no pasa nada: se devuelve el error original y
+una conexión que funcionaba por su nombre sigue funcionando.
+
+### Cuando el canal no llega a estar listo
+
+Si el terminal **arranca y atiende el canal IPC con normalidad** pero nunca
+llega al servidor, `mt5.login()` expira con `-10005`.
 
 Eso se confunde fácilmente con otras dos cosas, y las tres se tratan distinto:
 

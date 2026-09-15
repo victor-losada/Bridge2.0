@@ -494,3 +494,81 @@ def test_conectar_a_otro_servidor_del_mismo_broker_se_corta(monkeypatch, tmp_pat
 
     with pytest.raises(mt5_module.MT5ConnectionError, match="Servidor inesperado"):
         client.initialize_and_login(541446323, "buena", "FTMO-Server4")
+
+
+class _TimeoutConElNombre:
+    """El síntoma del Slot-04: con el nombre da -10005, con la dirección entra.
+
+    Un slot que viene de otra cuenta ni llega a atender el canal, así que el
+    mismo bróker ausente que en un slot limpio da -6 aquí da -10005. Atar el
+    rescate al -6 lo dejaba sin ejecutarse justo donde hacía falta.
+    """
+
+    DIRECCION = "35.234.132.67:443"
+
+    def __init__(self) -> None:
+        self.servidores_probados: list[str] = []
+        self.arranques_largos = 0
+
+    def initialize(self, path=None, timeout=None, portable=None, **kw):
+        if "login" not in kw:
+            self.arranques_largos += 1
+            return False
+        self.servidores_probados.append(kw.get("server", ""))
+        return kw.get("server") == self.DIRECCION
+
+    def last_error(self):
+        return IPC_TIMEOUT
+
+    def shutdown(self):
+        pass
+
+    def account_info(self):
+        cuenta = _CuentaMT5(541446323)
+        cuenta.server = "FTMO-Server4"
+        cuenta.name = "Prueba"
+        return cuenta
+
+
+def test_un_timeout_tambien_dispara_la_busqueda_de_direccion(monkeypatch, tmp_path) -> None:
+    fake = _TimeoutConElNombre()
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    monkeypatch.setattr(
+        mt5_module.broker_directory,
+        "puntos_de_acceso",
+        lambda nombre, **kw: [_TimeoutConElNombre.DIRECCION],
+    )
+    (tmp_path / "terminal64.exe").write_text("exe")
+    client = MT5Client(tmp_path)
+
+    client.initialize_and_login(541446323, "buena", "FTMO-Server4")
+
+    # Dos intentos con el nombre (el reintento tras limpiar), luego la dirección.
+    assert fake.servidores_probados == [
+        "FTMO-Server4",
+        "FTMO-Server4",
+        _TimeoutConElNombre.DIRECCION,
+    ]
+    # Y sin pagar el camino largo, que son diez minutos.
+    assert fake.arranques_largos == 0
+
+
+def test_si_la_direccion_tampoco_va_queda_el_camino_largo(monkeypatch, tmp_path) -> None:
+    """La dirección es un atajo, no un sustituto: el rodeo sigue existiendo."""
+    fake = _TimeoutConElNombre()
+    fake.DIRECCION = "nada:443"
+    monkeypatch.setattr(mt5_module, "mt5", fake)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    monkeypatch.setattr(mt5_module, "_kill_slot_terminals", lambda root: None)
+    monkeypatch.setattr(
+        mt5_module.broker_directory, "puntos_de_acceso", lambda nombre, **kw: ["x:443"]
+    )
+    monkeypatch.setattr(MT5Client, "_restart_portable_terminal", lambda self, exe: None)
+    (tmp_path / "terminal64.exe").write_text("exe")
+    client = MT5Client(tmp_path)
+
+    with pytest.raises(mt5_module.MT5ConnectionError):
+        client.initialize_and_login(541446323, "buena", "FTMO-Server4")
+
+    assert fake.arranques_largos > 0

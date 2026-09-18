@@ -483,7 +483,40 @@ Bajar de esos ~12 minutos exige saber que el servidor es desconocido **antes**
 de intentarlo, y eso depende de si la lista de servidores es transplantable
 entre terminales, que está sin verificar.
 
-## 11. Qué falta antes de exponerlo a internet
+## 11. Notas de seguridad
+
+Revisado con el método de [cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill)
+(MIT). Lo que sostiene el modelo de amenazas, y lo que no.
+
+### Lo que ya protege
+
+| | |
+|---|---|
+| Contraseñas MT5 | Fernet en reposo; en claro solo en memoria del Manager y en el entorno del hijo. Nunca en argv, ni en logs, ni en `public_dict()`. |
+| Clave de la API | Comparación en tiempo constante (`secrets.compare_digest`), sin cortocircuito por el primer byte. Obligatoria y de 16 caracteres mínimo: un `.env` a medias impide arrancar en vez de abrir la puerta. |
+| `slot_id` de la petición | Se valida contra el pool antes de tocar ninguna ruta, así que no hay travesía de directorios por ahí. |
+| Sumidero `/debug/events` | Apagado salvo `ENABLE_DEBUG_SINK=true`. Encendido, cualquiera con una clave válida llena el disco. |
+
+### Lo que sigue abierto
+
+**HTTP en claro.** `/accounts/connect` lleva la contraseña MT5 del cliente en
+el cuerpo. Sin TLS, cualquiera en el camino entre el Core y el Bridge las lee
+todas. Es el riesgo mayor del despliegue actual y se cierra con dominio +
+certificado.
+
+**El directorio de brókers es un tercero en el camino de una credencial.**
+Quien controle `BROKER_DIRECTORY_URL` elige a qué host se conecta el terminal.
+Mitigado con HTTPS, validación del formato, un solo punto de acceso por
+intento, y comprobación de que el servidor se identifique con el nombre
+pedido. Pero un directorio comprometido podría dirigir una conexión antes de
+que esa última comprobación sirva de algo. **Vaciar la variable lo desactiva**
+y deja el resto igual; solo se pierde el alta automática de brókers nuevos.
+
+**Inicio de sesión automático** (sección 10): quien alcance la consola del
+servidor entra al escritorio sin credenciales, y ahí está el `.env` con la
+`FERNET_KEY`. Asumible en un dedicado con el RDP cerrado por firewall.
+
+## 12. Qué falta antes de exponerlo a internet
 
 | | Por qué |
 |---|---|

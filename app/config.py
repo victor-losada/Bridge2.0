@@ -59,6 +59,17 @@ class Settings(BaseSettings):
     # operacion en un evento trade.candles, para que el Core pueda dibujarla.
     # Apagado por defecto: un Core que no conozca el evento lo rechazaria.
     emit_trade_candles: bool = False
+
+    # Sumidero local de eventos en /api/v1/debug/events. Escribe cuanto le
+    # manden en data/events.jsonl, sin limite: util en local, un disco que se
+    # llena en produccion. Apagado salvo que se pida.
+    enable_debug_sink: bool = False
+
+    # Directorio publico que traduce el nombre de un broker a su direccion,
+    # para dar de alta brokers que el terminal no conoce. Es un TERCERO que
+    # decide a que host se conecta el terminal con las credenciales de un
+    # cliente: vaciarlo desactiva el alta automatica y deja el resto igual.
+    broker_directory_url: str = "https://search.mtapi.io/Search"
     # Velas alrededor del trade. 150 encuadra bien la operacion sin inflar el
     # payload (~8 KB). El timeframe se elige solo segun lo que duro el trade.
     trade_candles_count: int = 150

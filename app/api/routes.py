@@ -6,6 +6,8 @@ import json
 import logging
 
 import httpx
+import secrets
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from app.config import Settings, get_settings
@@ -26,15 +28,34 @@ def _manager(request: Request) -> SlotManager:
     return mgr
 
 
+def _token_de(x_api_key: str | None, authorization: str | None) -> str:
+    if x_api_key:
+        return x_api_key
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1]
+    return ""
+
+
+def _coincide(token: str, *validas: str) -> bool:
+    """Compara sin cortocircuito por el primer byte distinto.
+
+    `==` sobre str se detiene en la primera diferencia, y el tiempo que tarda
+    filtra información sobre la clave. Se comparan TODAS las candidatas aunque
+    una acierte, para que el tiempo tampoco delate cuál era.
+    """
+    acierto = False
+    for valida in validas:
+        if secrets.compare_digest(token.encode(), valida.encode()):
+            acierto = True
+    return acierto
+
+
 def require_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> None:
-    token = x_api_key
-    if not token and authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1]
-    if token != settings.bridge_api_key:
+    if not _coincide(_token_de(x_api_key, authorization), settings.bridge_api_key):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -44,10 +65,8 @@ def require_core_or_bridge_key(
     settings: Settings = Depends(get_settings),
 ) -> None:
     """El Worker manda CORE_API_KEY; el sink local acepta esa o la del Manager."""
-    token = x_api_key
-    if not token and authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1]
-    if token not in {settings.bridge_api_key, settings.core_api_key}:
+    token = _token_de(x_api_key, authorization)
+    if not _coincide(token, settings.bridge_api_key, settings.core_api_key):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -240,10 +259,15 @@ async def debug_events(request: Request) -> dict:
 
     CORE_EVENTS_URL=http://127.0.0.1:8088/api/v1/debug/events
     """
+    settings = get_settings()
+    if not settings.enable_debug_sink:
+        # Escribe cuanto le manden en data/events.jsonl. Util en local, un
+        # disco que se llena en produccion. Fuera salvo que se pida.
+        raise HTTPException(status_code=404, detail="not found")
+
     payload = await request.json()
     event_name = payload.get("event")
     logger.info("debug event=%s account_id=%s", event_name, payload.get("account_id"))
-    settings = get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     sink = settings.data_dir / "events.jsonl"
     with sink.open("a", encoding="utf-8") as handle:

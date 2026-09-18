@@ -20,6 +20,7 @@ slot que nunca había visto ese bróker, y MT5 devuelve el nombre canónico
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Callable
 
@@ -30,7 +31,15 @@ logger = logging.getLogger(__name__)
 #: Espejo público del directorio de brókers de MT5. Va por HTTPS a propósito:
 #: quien pudiera alterar esta respuesta elegiría a qué máquina manda el
 #: terminal la contraseña de un cliente.
+#:
+#: Es un TERCERO en el camino de unas credenciales, así que es configurable:
+#: BROKER_DIRECTORY_URL vacío desactiva el alta automática de brókers y deja
+#: el resto del sistema igual. Quien no lo quiera, no lo tiene.
 DIRECTORIO_URL = "https://search.mtapi.io/Search"
+
+
+def _url_configurada() -> str:
+    return os.environ.get("BROKER_DIRECTORY_URL", DIRECTORIO_URL).strip()
 
 #: host:puerto. Se valida antes de usarlo porque lo que sale de aquí acaba
 #: siendo el destino de unas credenciales.
@@ -82,7 +91,7 @@ def puntos_de_acceso(
     nombre: str,
     *,
     timeout: float = 8.0,
-    url: str = DIRECTORIO_URL,
+    url: str | None = None,
     fetch: Callable[[str, str, float], object] | None = None,
 ) -> list[str]:
     """Direcciones `host:puerto` de ese servidor, o lista vacía.
@@ -92,6 +101,10 @@ def puntos_de_acceso(
     """
     if parece_direccion(nombre):
         return []  # ya es una dirección; no hay nada que resolver
+    url = _url_configurada() if url is None else url
+    if not url:
+        logger.info("alta automática de brókers desactivada (sin directorio)")
+        return []
     try:
         payload = (fetch or _pedir)(url, nombre, timeout)
     except Exception:

@@ -90,3 +90,32 @@ def test_reconoce_una_direccion():
     assert parece_direccion("broker.example.com:443") is True
     assert parece_direccion("FTMO-Server4") is False
     assert parece_direccion("NYSMarketsLtd-trade") is False
+
+
+def test_se_puede_desactivar_el_directorio(monkeypatch):
+    """Es un tercero decidiendo a qué host van unas credenciales.
+
+    Quien no quiera esa dependencia la apaga, y el resto del sistema sigue
+    igual: los brókers que el terminal ya conoce conectan por su nombre.
+    """
+    monkeypatch.setenv("BROKER_DIRECTORY_URL", "")
+
+    def no_deberia_llamarse(url, nombre, timeout):
+        raise AssertionError("con el directorio desactivado no se consulta nada")
+
+    assert puntos_de_acceso("FTMO-Server4", fetch=no_deberia_llamarse) == []
+
+
+def test_el_directorio_se_puede_apuntar_a_otro_sitio(monkeypatch):
+    monkeypatch.setenv("BROKER_DIRECTORY_URL", "https://interno.example/buscar")
+    vistas: list[str] = []
+
+    def espia(url, nombre, timeout):
+        vistas.append(url)
+        return RESPUESTA
+
+    assert puntos_de_acceso("FTMO-Server4", fetch=espia) == [
+        "35.234.132.67:443",
+        "185.96.244.5:443",
+    ]
+    assert vistas == ["https://interno.example/buscar"]

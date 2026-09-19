@@ -17,6 +17,7 @@ from pathlib import Path
 import psutil
 
 from app.config import Settings
+from app.utils import ruta_dentro_de
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,18 @@ class ProcessManager:
         proc = self._procs.get(slot_id)
         return proc is not None and proc.poll() is None
 
+    def exit_code(self, slot_id: str) -> int | None:
+        """Código de salida del último Worker de ese slot, o None si sigue vivo.
+
+        El Worker devuelve 2 cuando el bróker RECHAZÓ las credenciales, que es
+        la única señal inequívoca de fallo concluyente. Sin leerla, el Manager
+        solo ve "vivo/muerto" y vuelve a lanzarlo con la misma contraseña,
+        anulando el corte que el propio Worker impone para no arriesgar el
+        bloqueo de la cuenta del cliente en el bróker.
+        """
+        proc = self._procs.get(slot_id)
+        return None if proc is None else proc.poll()
+
     def worker_pid(self, slot_id: str) -> int | None:
         proc = self._procs.get(slot_id)
         if proc is None or proc.poll() is not None:
@@ -136,7 +149,7 @@ def kill_portable_terminal(terminal_path: Path, timeout_sec: float) -> None:
             exe = (proc.info.get("exe") or "")
             if "terminal64.exe" not in name and "terminal.exe" not in name:
                 continue
-            if exe and str(Path(exe).resolve()).lower().startswith(root_s):
+            if ruta_dentro_de(exe, root_s):
                 victims.append(proc)
         except (psutil.Error, OSError):
             continue

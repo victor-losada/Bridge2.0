@@ -9,6 +9,19 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Valores de ejemplo publicados en este repositorio. Cualquiera que haya visto
+# el árbol los conoce, así que no pueden servir como credencial: si llegan al
+# .env desplegado, el Bridge no arranca en vez de arrancar y parecer seguro.
+CLAVES_DE_EJEMPLO = frozenset(
+    {
+        "cambiame-por-una-cadena-larga-y-aleatoria",
+        "cambia-esta-clave-bridge",
+        "la-que-espera-el-core",
+        "pon-aqui-una-clave-larga",
+    }
+)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -20,6 +33,9 @@ class Settings(BaseSettings):
     bridge_host: str = "0.0.0.0"
     bridge_port: int = 8088
     bridge_api_key: str = Field(..., min_length=16)
+    # Tope del cuerpo de una petición. El mayor cuerpo legítimo es el alta de
+    # cuenta, de unos cientos de bytes; 1 MiB deja margen de sobra.
+    max_request_bytes: int = 1_048_576
 
     # Core
     core_events_url: str = "http://localhost:8000/internal/bridge/events"
@@ -31,6 +47,16 @@ class Settings(BaseSettings):
 
     # Cifrado en reposo (Fernet.urlsafe_b64)
     fernet_key: str = Field(..., min_length=32)
+
+    @field_validator("bridge_api_key", "core_api_key")
+    @classmethod
+    def _no_es_de_ejemplo(cls, v: str, info) -> str:  # noqa: ANN001
+        if v.strip().lower() in CLAVES_DE_EJEMPLO:
+            raise ValueError(
+                f"{info.field_name} tiene el valor de ejemplo del repositorio. "
+                "Genera una cadena larga y aleatoria antes de arrancar."
+            )
+        return v
 
     # Pool
     slot_count: int = 15

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -39,12 +41,40 @@ def mt5_time_to_utc(value: Any) -> datetime:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
     if isinstance(value, (int, float)):
-        # time_msc viene en milisegundos
+        # time_msc viene en milisegundos; algunos brókers entregan microsegundos.
         ts = float(value)
-        if ts > 10_000_000_000:
+        if ts != ts or ts in (float("inf"), float("-inf")):
+            # NaN o infinito: fromtimestamp lanzaría y el fallo subiría hasta
+            # el bucle del Worker, dejando sin correr los demás sondeos.
+            return utc_now()
+        while ts > 10_000_000_000:
             ts = ts / 1000.0
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            # Fuera del rango representable: una marca de tiempo absurda de un
+            # tercero no puede tumbar el ciclo de sondeo entero.
+            return utc_now()
     return utc_now()
+
+
+def ruta_dentro_de(exe: str | None, raiz_lower: str) -> bool:
+    """¿El ejecutable cuelga de esa carpeta de slot?
+
+    Comparar prefijos de cadena a secas no sirve: `...\\terminals\\slot-1` es
+    prefijo de `...\\terminals\\slot-10`, y también de cualquier carpeta dejada
+    al lado con un nombre parecido (`Slot-01.bak`, típica en un sistema cuyos
+    slots se clonan de una plantilla). Parar un slot mataba entonces el
+    terminal de otra cuenta. Exigimos que tras la raíz venga un separador.
+    """
+    if not exe:
+        return False
+    try:
+        candidato = str(Path(exe).resolve()).lower()
+    except OSError:
+        return False
+    raiz = raiz_lower.rstrip("\\/")
+    return candidato == raiz or candidato.startswith(raiz + os.sep) or candidato.startswith(raiz + "/")
 
 
 def volumes_equal(a: float, b: float) -> bool:

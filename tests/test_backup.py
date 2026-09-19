@@ -76,7 +76,10 @@ def test_poda_deja_solo_las_mas_recientes(tmp_path: Path) -> None:
 
     borradas = poda(copias, keep=2)
 
-    quedan = sorted(d.name for d in copias.iterdir())
+    # copias.json es el registro de lo que la herramienta ha creado: la poda
+    # solo borra lo que esté ahi, para que un senuelo dejado en el destino no
+    # pueda provocar el borrado de las copias legitimas.
+    quedan = sorted(d.name for d in copias.iterdir() if d.is_dir())
     assert quedan == ["bridge-backup-20260829-0300", "bridge-backup-20260830-0300"]
     assert [d.name for d in borradas] == [
         "bridge-backup-20260827-0300",
@@ -91,7 +94,7 @@ def test_poda_con_keep_cero_no_borra_nada(tmp_path: Path) -> None:
     backup(root, copias, marca="20260830-0300")
 
     assert poda(copias, keep=0) == []
-    assert len(list(copias.iterdir())) == 1
+    assert len([d for d in copias.iterdir() if d.is_dir()]) == 1
 
 
 def test_poda_no_toca_lo_que_no_ha_creado_el_backup(tmp_path: Path) -> None:

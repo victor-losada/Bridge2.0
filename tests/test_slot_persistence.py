@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from app.config import Settings
-from app.manager.slot_manager import SlotManager
+from app.manager.slot_manager import SlotManager, SlotManagerError
 from app.manager.state import SlotStatus
 
 FERNET = "Ky1DFHTvPX2CjJKcgTLdmB2fF2ZQK5Xz3mFvMHVGLJU="
@@ -301,3 +301,105 @@ async def test_desvincular_libera_todas_las_asignaciones_de_la_cuenta(
         if item.get("account_id") == "uuid-nys"
     ], "slots.json aún tiene la cuenta desvinculada"
     assert segundo.slot_id  # el segundo connect devolvió un slot válido
+
+
+async def test_el_watchdog_sobrevive_a_un_runtime_json_corrupto(tmp_path: Path) -> None:
+    """Regresión: un fichero con tipos incompatibles mataba la vigilancia entera.
+
+    `_core_channel_error` compara marcas de tiempo; con un `int` y un `str` el
+    `>` lanza TypeError. Antes eso terminaba la tarea `slot-watch` y el Manager
+    dejaba de vigilar TODOS los slots, sin un solo rastro: `/slots` seguía
+    respondiendo con datos congelados.
+    """
+    spawned: list = []
+    manager = await _manager(tmp_path, spawned)
+    estado = manager.slots["Slot-01"]
+    estado.account_id = "uuid-envenenada"
+    estado.status = SlotStatus.CONNECTING
+    manager.proc.is_running = lambda slot_id: True  # type: ignore[method-assign]
+
+    envenenado = manager.slot_dir("Slot-01") / "slot_runtime.json"
+    envenenado.write_text(
+        json.dumps(
+            {
+                "status": "connected",
+                "emit": {
+                    "last_error": "x",
+                    "last_error_at": 1,
+                    "last_ok_at": "2026-01-01T00:00:00Z",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # El ciclo tiene que tragarse el fallo y seguir vivo.
+    await manager._watch_once()
+    await manager._watch_once()
+
+
+async def test_desvincular_falla_si_no_se_puede_persistir(tmp_path: Path) -> None:
+    """Regresión: la desvinculación respondía ok sin haberla escrito en disco.
+
+    El olvido solo ocurría en memoria; el fichero conservaba la contraseña
+    cifrada y la cuenta revivía sola en el siguiente arranque del Manager.
+    """
+    spawned: list = []
+    manager = await _manager(tmp_path, spawned)
+    await manager.connect(
+        account_id="uuid-nys",
+        mt5_login=203395,
+        mt5_password="secreta",
+        mt5_server="NYSMarketsLtd-trade",
+        investor=False,
+    )
+    manager._save_assignments = lambda: False  # type: ignore[method-assign]
+
+    with pytest.raises(SlotManagerError):
+        await manager.disconnect(account_id="uuid-nys")
+
+
+async def test_conectar_borra_tambien_el_runtime_del_inquilino_anterior(
+    tmp_path: Path,
+) -> None:
+    """Regresión: el cliente entrante heredaba estado y contadores del saliente."""
+    spawned: list = []
+    manager = await _manager(tmp_path, spawned)
+    runtime = manager.slot_dir("Slot-01") / "slot_runtime.json"
+    runtime.write_text(
+        json.dumps({"status": "connected", "account_id": "cuenta-anterior"}),
+        encoding="utf-8",
+    )
+
+    await manager.connect(
+        account_id="cuenta-nueva",
+        mt5_login=111,
+        mt5_password="secreta",
+        mt5_server="Broker",
+        slot_id="Slot-01",
+    )
+
+    assert not runtime.exists(), "el runtime del inquilino anterior sigue ahí"
+
+
+async def test_el_ciclo_del_watchdog_no_muere_por_una_excepcion(tmp_path: Path) -> None:
+    """Cinturón y tirantes: aunque algo falle dentro, la tarea sigue viva.
+
+    El endurecimiento de `_core_channel_error` cierra el caso conocido; este
+    test fija que cualquier OTRO fallo futuro tampoco pueda dejar al pool sin
+    vigilancia, que era lo grave.
+    """
+    spawned: list = []
+    manager = await _manager(tmp_path, spawned)
+    fallos = {"n": 0}
+
+    async def _explota() -> None:
+        fallos["n"] += 1
+        raise RuntimeError("algo inesperado dentro del ciclo")
+
+    manager._watch_once = _explota  # type: ignore[method-assign]
+    tarea = asyncio.create_task(manager._watch_workers())
+    await asyncio.sleep(7)  # dos vueltas del ciclo, que duerme 3 s
+    assert not tarea.done(), "el watchdog murió con la primera excepción"
+    assert fallos["n"] >= 2, "el ciclo dejó de intentarlo"
+    tarea.cancel()

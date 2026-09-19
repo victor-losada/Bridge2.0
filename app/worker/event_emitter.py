@@ -162,7 +162,13 @@ class EventEmitter:
             return None, problem, False
 
         self._stats.last_status = response.status_code
-        if response.status_code < 400:
+        # Solo un 2xx cuenta como entregado. Antes bastaba con `< 400`, de modo
+        # que una redirección (un proxy que fuerza https, una barra final que se
+        # canonicaliza, un balanceador) marcaba el trade como emitido para
+        # siempre: queda en worker_state.json, sobrevive a los reinicios y no se
+        # reintenta jamás, mientras /slots sigue en verde. El cliente httpx no
+        # sigue redirecciones, así que un 3xx nunca llegó al Core.
+        if 200 <= response.status_code < 300:
             rejection = core_rejection(response.text)
             if rejection is not None:
                 # Entregado pero descartado: reintentar no arregla nada.

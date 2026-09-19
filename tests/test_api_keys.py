@@ -48,3 +48,55 @@ def test_lee_la_cabecera_y_el_bearer():
 
 def test_la_cabecera_gana_al_bearer():
     assert _token_de("directa", "Bearer otra") == "directa"
+
+
+def test_la_clave_de_ejemplo_del_repositorio_no_arranca() -> None:
+    """Regresión: el marcador publicado satisfacía el único control (16 chars).
+
+    Cualquiera que haya visto el repositorio conoce esas cadenas. Si llegan al
+    .env desplegado, el Bridge tiene que negarse a arrancar en vez de arrancar
+    y parecer seguro.
+    """
+    import pytest
+
+    from app.config import CLAVES_DE_EJEMPLO, Settings
+
+    fernet = "Ky1DFHTvPX2CjJKcgTLdmB2fF2ZQK5Xz3mFvMHVGLJU="
+    for ejemplo in ("cambiame-por-una-cadena-larga-y-aleatoria", "cambia-esta-clave-bridge"):
+        assert ejemplo in CLAVES_DE_EJEMPLO
+        with pytest.raises(Exception):
+            Settings(bridge_api_key=ejemplo, core_api_key="y" * 8, fernet_key=fernet)
+
+    # Una clave propia sigue valiendo.
+    ok = Settings(bridge_api_key="z" * 24, core_api_key="y" * 8, fernet_key=fernet)
+    assert ok.bridge_api_key == "z" * 24
+
+
+def test_un_cuerpo_enorme_se_rechaza_antes_de_leerlo() -> None:
+    """Regresión: la autenticación es dependencia de ruta y corre TRAS el cuerpo.
+
+    Sin tope, un anónimo hace que el único proceso que atiende a todas las
+    cuentas lea y decodifique lo que le mande antes de responderle 401.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.limits import LimitarCuerpo
+
+    app = FastAPI()
+
+    @app.post("/eco")
+    async def _eco(payload: dict) -> dict:  # noqa: ANN001
+        return payload
+
+    app.add_middleware(LimitarCuerpo, max_bytes=4096)
+    cliente = TestClient(app, raise_server_exceptions=False)
+
+    grande = cliente.post(
+        "/eco", content=b"A" * 100_000, headers={"Content-Type": "application/json"}
+    )
+    assert grande.status_code == 413
+
+    pequeno = cliente.post("/eco", json={"hola": "mundo"})
+    assert pequeno.status_code == 200
+    assert pequeno.json() == {"hola": "mundo"}

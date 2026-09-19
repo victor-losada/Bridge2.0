@@ -184,3 +184,30 @@ def test_lo_que_viaja_por_el_cable_incluye_ambas_grafias() -> None:
     assert enviado["accountId"] == "acc-1"
     assert enviado["account_id"] == "acc-1"
     assert enviado["event"] == "account.snapshot"
+
+
+def test_una_redireccion_no_cuenta_como_entregado() -> None:
+    """Regresión: `< 400` daba por emitido un 3xx.
+
+    El cliente no sigue redirecciones, así que un 301 o un 302 nunca llegó al
+    Core; darlo por bueno marcaba el trade como emitido en worker_state.json,
+    sobrevivía a los reinicios y no se reintentaba jamás, con /slots en verde.
+    """
+    for status in (301, 302, 307, 308):
+        emitter, seen = _emitter(
+            lambda r, status=status: httpx.Response(status, text="Moved"),
+            max_attempts=2,
+        )
+        assert emitter.emit(_event()) is False, f"{status} no puede contar como enviado"
+        stats = emitter.stats()
+        assert stats["sent"] == 0
+        assert stats["failed"] >= 1
+        assert len(seen) == 2, "un 3xx sí se reintenta: puede ser transitorio"
+
+
+def test_un_2xx_sigue_contando_como_entregado() -> None:
+    """El camino bueno no cambia: 200, 201 y 204 siguen siendo entrega."""
+    for status in (200, 201, 204):
+        emitter, _ = _emitter(lambda r, status=status: httpx.Response(status))
+        assert emitter.emit(_event()) is True
+        assert emitter.stats()["sent"] == 1

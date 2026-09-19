@@ -21,6 +21,7 @@ contraseña, no en una carpeta compartida.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from datetime import datetime
@@ -51,18 +52,74 @@ def _ignora_plantilla(directory: str, names: list[str]) -> set[str]:
 PATRON = "bridge-backup-*"
 
 
+#: Registro de lo que este script ha creado de verdad. Sin él, la poda decide
+#: qué destruir mirando solo los nombres que encuentra en el destino, y basta
+#: con que alguien cree ahí `bridge-backup-99991231-2359` —una carpeta vacía,
+#: sin escribir un byte dentro— para que las copias legítimas se vayan todas.
+REGISTRO = "copias.json"
+
+
+def _leer_registro(dest: Path) -> list[str]:
+    fichero = dest / REGISTRO
+    if not fichero.is_file():
+        return []
+    try:
+        datos = json.loads(fichero.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(datos, list):
+        return []
+    return [str(x) for x in datos if isinstance(x, str)]
+
+
+def _escribir_registro(dest: Path, nombres: list[str]) -> None:
+    try:
+        (dest / REGISTRO).write_text(
+            json.dumps(nombres, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        print("  aviso: no se pudo actualizar el registro de copias")
+
+
+def anotar(dest: Path, carpeta: Path) -> None:
+    """Apunta una copia recién creada en el registro del destino."""
+    nombres = _leer_registro(dest)
+    if carpeta.name not in nombres:
+        nombres.append(carpeta.name)
+    _escribir_registro(dest, nombres)
+
+
 def poda(dest: Path, keep: int) -> list[Path]:
     """Deja solo las `keep` copias más recientes. Devuelve las borradas.
+
+    Solo se borra lo que ESTE script anotó al crearlo. Una carpeta que encaje
+    con el patrón pero no esté en el registro se deja en paz y se avisa: puede
+    ser una copia manual del operador, o un señuelo puesto por alguien que
+    pueda escribir en el destino.
 
     La marca de tiempo es AAAAMMDD-HHMMSS, así que ordenar por nombre ordena
     por fecha sin tocar el disco.
     """
     if keep <= 0:
         return []
-    copias = sorted((d for d in dest.glob(PATRON) if d.is_dir()), key=lambda d: d.name)
-    sobran = copias[:-keep]
+    presentes = sorted((d for d in dest.glob(PATRON) if d.is_dir()), key=lambda d: d.name)
+    if not (dest / REGISTRO).is_file() and presentes:
+        # Primera ejecución tras la actualización: las copias que ya están las
+        # creó la versión anterior de esta misma herramienta, así que se
+        # adoptan. Si no, no se podaría nunca y el disco acabaría lleno, que es
+        # un daño seguro frente a uno hipotético.
+        print(f"  registro nuevo: adopto {len(presentes)} copia(s) ya presentes")
+        _escribir_registro(dest, [d.name for d in presentes])
+    registradas = set(_leer_registro(dest))
+    ajenas = [d for d in presentes if d.name not in registradas]
+    for extraña in ajenas:
+        print(f"  no la borro, no la cree yo: {extraña.name}")
+    copias = [d for d in presentes if d.name in registradas]
+    sobran = copias[:-keep] if keep < len(copias) else []
     for vieja in sobran:
         shutil.rmtree(vieja)
+    vivas = [d.name for d in copias if d not in sobran]
+    _escribir_registro(dest, vivas)
     return sobran
 
 
@@ -133,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"{args.root.resolve()} no parece la raíz del Bridge")
 
     destino = backup(args.root, args.dest, template=args.template)
+    anotar(args.dest, destino)
 
     for vieja in poda(args.dest, args.keep):
         print(f"  borrada   {vieja.name}")

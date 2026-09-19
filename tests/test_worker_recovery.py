@@ -526,3 +526,109 @@ def test_el_estado_guardado_dice_de_quien_es(tmp_path: Path) -> None:
     guardado = _json.loads((tmp_path / "worker_state.json").read_text(encoding="utf-8"))
     assert guardado["account_id"] == "acc-1"
     assert guardado["mt5_login"] == 999
+
+
+class _ClienteHistorial:
+    """Cliente MT5 de juguete que solo sabe de historial y de una cuenta."""
+
+    def __init__(self, deals: list) -> None:
+        self._deals = deals
+
+    def initialize_and_login(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+        pass
+
+    def history_deals(self, dias: int) -> list:
+        return list(self._deals)
+
+    def history_orders(self, dias: int) -> list:
+        return []
+
+    def positions(self) -> list:
+        return []
+
+    def account_info(self):  # noqa: ANN201
+        from app.worker.mt5_client import AccountSnapshot
+
+        return AccountSnapshot(
+            login=999,
+            balance=1000.0,
+            equity=1000.0,
+            margin=0.0,
+            free_margin=1000.0,
+            margin_level=None,
+            profit=0.0,
+            currency="USD",
+            leverage=100,
+            name="Cuenta de juguete",
+            server="Broker-Server",
+        )
+
+    def shutdown(self) -> None:
+        pass
+
+
+def test_lo_cerrado_durante_la_caida_no_se_marca_como_enviado(tmp_path: Path) -> None:
+    """Regresión: `_bootstrap_history` tachaba como emitido lo que nunca mandó.
+
+    Una operación que se abre y se cierra entera mientras el Worker está caído
+    aparece ya cerrada en el historial al rearrancar. Sembrarla como "ya
+    enviada" la perdía para siempre: ni el siguiente poll ni un tercer arranque
+    la recuperan. Solo se siembra lo que ya era conocido.
+    """
+    from types import SimpleNamespace
+
+    from app.worker.deal_matcher import (
+        DEAL_ENTRY_IN,
+        DEAL_ENTRY_OUT,
+        DEAL_TYPE_BUY,
+        DEAL_TYPE_SELL,
+    )
+
+    def _deal(ticket, pid, entry, tipo, vol, precio, minuto):
+        """Un TradeDeal como el que entrega MetaTrader5 (namedtuple laxo)."""
+        return SimpleNamespace(
+            ticket=ticket,
+            position_id=pid,
+            type=tipo,
+            entry=entry,
+            symbol="EURUSD",
+            volume=vol,
+            price=precio,
+            profit=0.0 if entry == DEAL_ENTRY_IN else 99.0,
+            swap=0.0,
+            commission=-0.3,
+            time=int(
+                datetime(2026, 9, 1, 12, minuto, tzinfo=timezone.utc).timestamp()
+            ),
+            order=ticket,
+            sl=0.0,
+            tp=0.0,
+            magic=0,
+            comment="",
+        )
+
+    vieja = [
+        _deal(1, 5000, DEAL_ENTRY_IN, DEAL_TYPE_BUY, 0.1, 1.10, 0),
+        _deal(2, 5000, DEAL_ENTRY_OUT, DEAL_TYPE_SELL, 0.1, 1.11, 5),
+    ]
+    # Se abrió y se cerró con el Worker parado: sus dos deals son nuevos.
+    durante_la_caida = [
+        _deal(3, 6000, DEAL_ENTRY_IN, DEAL_TYPE_BUY, 0.2, 1.20, 10),
+        _deal(4, 6000, DEAL_ENTRY_OUT, DEAL_TYPE_SELL, 0.2, 1.22, 20),
+    ]
+
+    # Arranque 1: solo existe la vieja, y se siembra sin emitir.
+    w1 = _worker(tmp_path, _ClienteHistorial(list(vieja)))
+    w1._bootstrap_history()
+    assert [e for e in w1.emitter.events if e == "trade.closed"] == []
+
+    # Arranque 2: el broker reentrega la ventana entera, con la nueva dentro.
+    w2 = _worker(tmp_path, _ClienteHistorial(list(vieja) + list(durante_la_caida)))
+    w2._load_persist()
+    assert w2._tenia_estado_previo
+    w2._bootstrap_history()
+    w2._poll_history()
+
+    cerrados = [e for e in w2.emitter.events if e == "trade.closed"]
+    assert len(cerrados) == 1, "la operación cerrada durante la caída se perdió"
+    assert 5000 in w2.matcher.emitted_position_ids, "la vieja no debía reemitirse"

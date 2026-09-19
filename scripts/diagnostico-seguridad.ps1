@@ -211,21 +211,48 @@ try {
 $workers = $procesos | Where-Object { $_.CommandLine -like "*app.worker*" }
 $uvicorn = $procesos | Where-Object { $_.CommandLine -like "*uvicorn*" }
 
-Write-Output ("Procesos uvicorn (Manager): " + @($uvicorn).Count)
-foreach ($p in $uvicorn) { Write-Output ("  PID " + $p.ProcessId) }
-Write-Output ("Procesos Worker: " + @($workers).Count)
-foreach ($p in $workers) {
-    $slot = "?"
-    if ($p.CommandLine -match "--slot-id\s+(\S+)") { $slot = $Matches[1] }
-    $padreVivo = $uvicorn | Where-Object { $_.ProcessId -eq $p.ParentProcessId }
-    $marca = ""
-    if (-not $padreVivo) { $marca = "  <-- SIN Manager padre vivo: posible huerfano" }
-    Write-Output ("  PID " + $p.ProcessId + "  padre " + $p.ParentProcessId + "  slot " + $slot + $marca)
+# En Windows, el python.exe del venv es un TRAMPOLIN: re-lanza el interprete
+# base como proceso hijo con la MISMA linea de comandos. Cada proceso logico
+# aparece por tanto como una pareja padre-hijo. Sin tenerlo en cuenta, un
+# recuento ingenuo ve el doble de Workers y da por huerfanos a los que de
+# verdad estan trabajando.
+function EsTrampolinDe($hijo, $todos) {
+    $padre = $todos | Where-Object { $_.ProcessId -eq $hijo.ParentProcessId }
+    if (-not $padre) { return $false }
+    return ($padre.CommandLine -replace '"', '') -eq ($hijo.CommandLine -replace '"', '')
 }
 
-$duplicados = $workers | ForEach-Object { if ($_.CommandLine -match "--slot-id\s+(\S+)") { $Matches[1] } } | Group-Object | Where-Object { $_.Count -gt 1 }
+$workersReales = $workers | Where-Object { -not (EsTrampolinDe $_ $procesos) }
+$uvicornReales = $uvicorn | Where-Object { -not (EsTrampolinDe $_ $procesos) }
+$hayTrampolin = @($workers).Count -ne @($workersReales).Count
+if ($hayTrampolin) {
+    Write-Output "Nota: el python.exe del venv re-lanza el interprete base, asi que"
+    Write-Output "cada proceso logico aparece como una pareja. Se cuentan las parejas."
+    Write-Output ""
+}
+
+Write-Output ("Managers (uvicorn): " + @($uvicornReales).Count)
+foreach ($p in $uvicornReales) { Write-Output ("  PID " + $p.ProcessId) }
+Write-Output ("Workers: " + @($workersReales).Count)
+foreach ($p in $workersReales) {
+    $slot = "?"
+    if ($p.CommandLine -match "--slot-id\s+(\S+)") { $slot = $Matches[1] }
+    # El padre legitimo es un Manager, o el trampolin del venv de ESTE worker.
+    $linaje = $p.ParentProcessId
+    $cadena = $procesos | Where-Object { $_.ProcessId -eq $linaje }
+    while ($cadena -and (($cadena.CommandLine -replace '"','') -eq ($p.CommandLine -replace '"',''))) {
+        $linaje = $cadena.ParentProcessId
+        $cadena = $procesos | Where-Object { $_.ProcessId -eq $linaje }
+    }
+    $padreVivo = $uvicorn | Where-Object { $_.ProcessId -eq $linaje }
+    $marca = ""
+    if (-not $padreVivo) { $marca = "  <-- sin Manager en su linaje: revisar antes de tocar nada" }
+    Write-Output ("  PID " + $p.ProcessId + "  slot " + $slot + $marca)
+}
+
+$duplicados = $workersReales | ForEach-Object { if ($_.CommandLine -match "--slot-id\s+(\S+)") { $Matches[1] } } | Group-Object | Where-Object { $_.Count -gt 1 }
 if ($duplicados) {
-    Write-Output "SLOTS CON MAS DE UN WORKER (esto no deberia pasar nunca):"
+    Write-Output "SLOTS CON MAS DE UN WORKER LOGICO (esto no deberia pasar nunca):"
     $duplicados | ForEach-Object { Write-Output ("  " + $_.Name + ": " + $_.Count + " procesos") }
 }
 

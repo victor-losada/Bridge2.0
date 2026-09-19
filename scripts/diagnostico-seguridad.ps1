@@ -55,6 +55,33 @@ Write-Output ("Fecha: " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
 Write-Output ("Raiz:  " + $Raiz)
 Write-Output ("Host:  " + $env:COMPUTERNAME + "   Usuario: " + $env:USERNAME)
 
+# ¿Es esta la maquina donde corre el Bridge de verdad? Sin esta comprobacion es
+# facil ejecutar el diagnostico en el equipo de desarrollo, ver "no existe" por
+# todas partes y sacar conclusiones tranquilizadoras sobre un servidor que ni
+# siquiera se ha mirado.
+$senales = @()
+if (-not (Test-Path (Join-Path $Raiz ".env")))            { $senales += "no hay .env" }
+if (-not (Test-Path (Join-Path $Raiz "data")))            { $senales += "no hay carpeta data" }
+$hayUvicorn = $false
+try {
+    $hayUvicorn = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction Stop |
+        Where-Object { $_.CommandLine -like "*uvicorn*" }).Count -gt 0
+} catch { }
+if (-not $hayUvicorn) { $senales += "no hay ningun proceso uvicorn" }
+$hayTarea = $false
+try { $hayTarea = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -like "*Bridge*" }).Count -gt 0 } catch { }
+if (-not $hayTarea) { $senales += "no hay tarea programada del Bridge" }
+
+if ($senales.Count -ge 3) {
+    Write-Output ""
+    Write-Output ("!" * 72)
+    Write-Output "ATENCION: esta NO parece la maquina donde corre el Bridge."
+    Write-Output ("Motivos: " + ($senales -join "; ") + ".")
+    Write-Output "El resto del informe describe ESTE equipo, no el servidor de"
+    Write-Output "produccion. No sirve para dar por buena la configuracion de alla."
+    Write-Output ("!" * 72)
+}
+
 # ---------------------------------------------------------------- 1. Claves
 Titulo "1. Claves del .env (solo longitud y huella; NUNCA el valor)"
 
@@ -292,7 +319,13 @@ try {
     if ($delPuerto) {
         foreach ($r in $delPuerto) {
             $af = $r | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
-            Write-Output ("Regla: " + $r.DisplayName)
+            $pf2 = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+            $ap = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+            # DisplayName puede venir sin resolver ("ms-resource:AppTitle"), asi
+            # que se imprime tambien el nombre interno y el programa.
+            Write-Output ("Regla: " + $r.DisplayName + "   [Name: " + $r.Name + "]")
+            Write-Output ("   Puertos:       " + ($pf2.LocalPort -join ", "))
+            Write-Output ("   Programa:      " + $(if ($ap.Program) { $ap.Program } else { "(cualquiera)" }))
             Write-Output ("   RemoteAddress: " + ($af.RemoteAddress -join ", "))
             if ($af.RemoteAddress -contains "Any") {
                 Write-Output "   <-- ABIERTO A CUALQUIER ORIGEN. Deberia estar limitado a la IP del Core."

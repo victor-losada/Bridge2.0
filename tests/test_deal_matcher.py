@@ -262,3 +262,35 @@ def test_el_estado_persistido_no_impide_reconstruir_el_buffer():
     assert len(trades) == 1, "el cierre tiene que emitirse tras el reinicio"
     assert trades[0].position_id == entrada.position_id
     assert trades[0].volume == 0.10
+
+
+def test_un_deal_de_reverso_avisa_en_vez_de_perderse_en_silencio(caplog) -> None:
+    """Regresión: el reverso (netting) hace perder una operación sin ruido.
+
+    El emparejador cuenta DEAL_ENTRY_INOUT solo como salida, así que la
+    exposición que ese mismo deal ABRE no vuelve a producir trade.closed.
+    Arreglarlo exige rediseñar el emparejador; mientras tanto, al menos tiene
+    que verse en el log.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from app.worker.deal_matcher import DEAL_ENTRY_INOUT
+    from app.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)  # sin tocar MT5 ni el emisor
+    worker._reversos_avisados = set()
+
+    reverso = SimpleNamespace(ticket=77, entry=DEAL_ENTRY_INOUT)
+    normal = SimpleNamespace(ticket=78, entry=DEAL_ENTRY_IN)
+
+    with caplog.at_level(logging.ERROR, logger="worker"):
+        worker._avisar_si_hay_reverso([normal, reverso])
+    assert "NETTING" in caplog.text
+    assert "77" in caplog.text
+
+    # No repite el aviso del mismo ticket en cada poll.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="worker"):
+        worker._avisar_si_hay_reverso([normal, reverso])
+    assert caplog.text == ""

@@ -33,6 +33,7 @@ from app.models.events import (
 )
 from app.utils import setup_logging, to_iso_z, utc_now
 from app.worker.deal_matcher import (
+    DEAL_ENTRY_INOUT,
     DealMatcher,
     deal_from_mt5,
     order_from_mt5,
@@ -134,6 +135,8 @@ class Worker:
         # error. Tres deja margen a un fallo transitorio del terminal.
         self._fallos_seguidos = 0
         self._FALLOS_PARA_ERROR = 3
+        # Tickets de reverso ya avisados, para no repetir el aviso en cada poll.
+        self._reversos_avisados: set[int] = set()
 
         self._last_runtime_status = "connecting"
         self._next_account = 0.0
@@ -408,6 +411,34 @@ class Worker:
         self._emit("account.snapshot", data.to_payload())
         _ = force
 
+    def _avisar_si_hay_reverso(self, deals: list) -> None:
+        """Grita si aparece un deal de reverso (DEAL_ENTRY_INOUT).
+
+        El emparejador cuenta ese deal solo como salida, así que la exposición
+        que ese mismo deal ABRE no vuelve a producir un trade.closed: la
+        operación se pierde en silencio. Arreglarlo bien exige rediseñar el
+        emparejador, y solo ocurre en cuentas *netting*; los challenges de
+        prop-firm son hedging y no los generan.
+
+        Mientras tanto, esto convierte una pérdida silenciosa en un aviso
+        visible: si algún día entra una cuenta netting, se sabe.
+        """
+        reversos = [d for d in deals if d.entry == DEAL_ENTRY_INOUT]
+        if not reversos:
+            return
+        nuevos = {d.ticket for d in reversos} - self._reversos_avisados
+        if not nuevos:
+            return
+        self._reversos_avisados |= nuevos
+        logger.error(
+            "CUENTA NETTING: %s deal(s) de reverso (DEAL_ENTRY_INOUT), tickets %s. "
+            "El emparejador no soporta este caso: la operación que abre el "
+            "reverso NO generará trade.closed. Revisa el histórico de esta "
+            "cuenta a mano y avisa para tratarlo.",
+            len(nuevos),
+            sorted(nuevos),
+        )
+
     def _pull_deals(self) -> list:
         raw = self.client.history_deals(self.history_lookback_days)
         parsed = []
@@ -422,6 +453,7 @@ class Worker:
                 continue
             if deal is not None:
                 parsed.append(deal)
+        self._avisar_si_hay_reverso(parsed)
         return parsed
 
     def _pull_orders(self) -> dict:

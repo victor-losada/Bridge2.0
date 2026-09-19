@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 import psutil
 
-from app.utils import mt5_time_to_utc, to_iso_z, utc_now
+from app.utils import mt5_time_to_utc, ruta_dentro_de, to_iso_z, utc_now
 from app.worker import broker_directory
 
 logger = logging.getLogger(__name__)
@@ -615,7 +615,7 @@ def _kill_slot_terminals(root_lower: str) -> None:
             exe = proc.info.get("exe") or ""
             if "terminal64.exe" not in name and "terminal.exe" not in name:
                 continue
-            if not exe or not str(Path(exe).resolve()).lower().startswith(root_lower):
+            if not ruta_dentro_de(exe, root_lower):
                 continue
             logger.info("kill terminal colgado pid=%s", proc.pid)
             proc.terminate()
@@ -634,11 +634,57 @@ def _slot_terminal_pid(root_lower: str) -> int | None:
             exe = proc.info.get("exe") or ""
             if "terminal64.exe" not in name and "terminal.exe" not in name:
                 continue
-            if exe and str(Path(exe).resolve()).lower().startswith(root_lower):
+            if ruta_dentro_de(exe, root_lower):
                 return int(proc.info["pid"])
         except (psutil.Error, OSError):
             continue
     return None
+
+
+def position_to_persist(pos: PositionSnapshot) -> dict[str, Any]:
+    """Serializa una posición para worker_state.json.
+
+    Distinta de `position_to_event_dict`: aquella es el contrato con el Core
+    y omite campos; esta tiene que poder reconstruir el snapshot entero para
+    que, tras un reinicio, `_poll_positions` compare contra el libro real y
+    no contra un libro vacío.
+    """
+    return {
+        "ticket": pos.ticket,
+        "symbol": pos.symbol,
+        "type": pos.type,
+        "volume": pos.volume,
+        "open_price": pos.open_price,
+        "current_price": pos.current_price,
+        "sl": pos.sl,
+        "tp": pos.tp,
+        "profit": pos.profit,
+        "swap": pos.swap,
+        "commission": pos.commission,
+        "open_time": pos.open_time.isoformat(),
+        "comment": pos.comment,
+        "magic": pos.magic,
+    }
+
+
+def position_from_persist(payload: dict[str, Any]) -> PositionSnapshot:
+    """Reconstruye una posición guardada. Lanza si el registro no sirve."""
+    return PositionSnapshot(
+        ticket=int(payload["ticket"]),
+        symbol=str(payload["symbol"]),
+        type=str(payload["type"]),
+        volume=float(payload["volume"]),
+        open_price=float(payload["open_price"]),
+        current_price=float(payload["current_price"]),
+        sl=float(payload["sl"]),
+        tp=float(payload["tp"]),
+        profit=float(payload["profit"]),
+        swap=float(payload["swap"]),
+        commission=float(payload["commission"]),
+        open_time=datetime.fromisoformat(str(payload["open_time"])),
+        comment=str(payload.get("comment", "")),
+        magic=int(payload.get("magic", 0)),
+    )
 
 
 def position_to_event_dict(pos: PositionSnapshot) -> dict[str, Any]:

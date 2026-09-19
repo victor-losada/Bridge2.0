@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.limits import LimitarCuerpo
 from app.api.routes import router
 from app.config import get_settings
 from app.manager.slot_manager import SlotManager
@@ -34,6 +35,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(router, prefix="/api/v1")
+# El tope va delante de todo: la autenticación es una dependencia de ruta y se
+# resuelve DESPUÉS de leer el cuerpo, así que sin esto un anónimo puede hacer
+# trabajar al proceso que atiende a todas las cuentas.
+app.add_middleware(LimitarCuerpo, max_bytes=get_settings().max_request_bytes)
 
 
 @app.get("/")

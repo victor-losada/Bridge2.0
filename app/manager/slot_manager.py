@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 _CORE_CHANNEL_PREFIX = "el Core no acepta eventos: "
 
+# Código con el que el Worker sale cuando el bróker rechazó las credenciales
+# (app/worker/worker.py:run). Es un veredicto del servidor, no un fallo
+# transitorio: relanzarlo solo arriesga el bloqueo de la cuenta.
+EXIT_CREDENCIALES = 2
+
 
 class SlotManagerError(RuntimeError):
     pass
@@ -37,8 +42,15 @@ def _core_channel_error(emit: dict, current: str | None) -> str | None:
     Las marcas de tiempo son ISO-8601 UTC de ancho fijo, así que comparar
     cadenas equivale a comparar instantes.
     """
+    # El fichero lo escribe el Worker, pero se lee sin esquema: si un campo
+    # llega con otro tipo, comparar lanza TypeError y antes eso mataba la tarea
+    # que vigila TODO el pool. Lo que no sea una cadena no se compara.
     error_at = emit.get("last_error_at")
     ok_at = emit.get("last_ok_at")
+    if not isinstance(error_at, str):
+        error_at = None
+    if not isinstance(ok_at, str):
+        ok_at = None
     if emit.get("last_error") and error_at and (not ok_at or error_at > ok_at):
         return f"{_CORE_CHANNEL_PREFIX}{emit['last_error']}"
     if current and current.startswith(_CORE_CHANNEL_PREFIX):
@@ -210,7 +222,15 @@ class SlotManager:
             for state in objetivos:
                 self._reclamar(state)
                 liberados.append(self.slots[state.slot_id])
-            self._save_assignments()
+            if not self._save_assignments():
+                # El Worker ya está parado y el estado en memoria limpio, pero
+                # el fichero conserva la credencial: si se respondiera éxito,
+                # la cuenta reviviría en el siguiente arranque del Manager y
+                # nadie se enteraría.
+                raise SlotManagerError(
+                    "los slots se pararon pero no se pudo persistir la "
+                    "desvinculación; reintenta cuando el disco lo permita"
+                )
             logger.info("liberados: %s", ", ".join(s.slot_id for s in liberados))
             return liberados
 
@@ -287,12 +307,20 @@ class SlotManager:
         raise SlotManagerError("no hay slots libres")
 
     def _olvidar_estado(self, slot_id: str) -> None:
-        """Tira el worker_state.json del slot. Que no exista es lo normal."""
-        estado = self.slot_dir(slot_id) / "worker_state.json"
-        try:
-            estado.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("no se pudo borrar %s", estado, exc_info=True)
+        """Tira el estado local del slot. Que no exista es lo normal.
+
+        Los dos ficheros, no solo uno: `slot_runtime.json` lleva el account_id,
+        el estado y los contadores de envío del inquilino anterior, y el
+        watchdog los adopta tal cual. Sin borrarlo, la cuenta entrante aparecía
+        en `/slots` como `connected` —sin haber intentado un solo login— con el
+        último error y las estadísticas de otro cliente.
+        """
+        for nombre in ("worker_state.json", "slot_runtime.json"):
+            fichero = self.slot_dir(slot_id) / nombre
+            try:
+                fichero.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("no se pudo borrar %s", fichero, exc_info=True)
 
     def _spawn(self, state: SlotState) -> None:
         assert state.account_id and state.mt5_login and state.mt5_server
@@ -310,8 +338,13 @@ class SlotManager:
         state.status = SlotStatus.CONNECTING
         state.touch()
 
-    def _save_assignments(self) -> None:
+    def _save_assignments(self) -> bool:
         """Guarda qué cuenta ocupa cada slot, para sobrevivir a un reinicio.
+
+        Devuelve si la escritura llegó a disco. Quien ordena un olvido tiene
+        que saberlo: si falla y se responde éxito igualmente, la credencial
+        cifrada sigue en el fichero y la cuenta revive sola en el siguiente
+        arranque del Manager.
 
         Sin esto, reiniciar el Manager deja al Core creyendo que hay cuentas
         conectadas mientras aquí no hay ninguna: dejan de llegar datos y nadie
@@ -336,8 +369,10 @@ class SlotManager:
             self._assignments_path.write_text(
                 json.dumps(payload, indent=2), encoding="utf-8"
             )
+            return True
         except Exception:
             logger.exception("no se pudo guardar %s", self._assignments_path)
+            return False
 
     def _load_assignments(self) -> list[SlotState]:
         """Lee slots.json y deja los slots asignados, sin arrancar nada."""
@@ -413,9 +448,25 @@ class SlotManager:
             return {}
 
     async def _watch_workers(self) -> None:
-        """Si el Worker muere y la cuenta sigue asignada, reintento limitado."""
+        """Si el Worker muere y la cuenta sigue asignada, reintento limitado.
+
+        El cuerpo del ciclo va blindado a propósito: esta tarea vigila TODO el
+        pool, y basta con que un `slot_runtime.json` traiga dos valores de tipo
+        incompatible para que una excepción la mate. Cuando eso pasaba, el
+        Manager dejaba de detectar Workers caídos, de relanzarlos y de
+        actualizar el estado de ninguna cuenta, sin un solo rastro: `/slots`
+        seguía respondiendo 200 con datos congelados.
+        """
         while True:
             await asyncio.sleep(3)
+            try:
+                await self._watch_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("fallo en el ciclo del watchdog; se continúa")
+
+    async def _watch_once(self) -> None:
             to_restart: list[str] = []
             async with self._lock:
                 for state in self.slots.values():
@@ -449,6 +500,18 @@ class SlotManager:
                         state.touch()
                         continue
                     if state.status in {SlotStatus.DISCONNECTED, SlotStatus.ERROR}:
+                        continue
+                    if self.proc.exit_code(state.slot_id) == EXIT_CREDENCIALES:
+                        # El bróker dijo que no. Relanzar no cambia el veredicto
+                        # y cada intento acerca la cuenta del cliente a un
+                        # bloqueo: el Worker ya corta por esto, pero su decisión
+                        # moría con el proceso.
+                        state.status = SlotStatus.ERROR
+                        state.last_error = (
+                            "credenciales rechazadas por el bróker: no se reintenta"
+                        )
+                        state.touch()
+                        logger.error("%s %s", state.slot_id, state.last_error)
                         continue
                     state.restart_count += 1
                     if state.restart_count > self.settings.worker_restart_max:

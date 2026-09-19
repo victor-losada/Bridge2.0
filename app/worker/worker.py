@@ -33,6 +33,7 @@ from app.models.events import (
 )
 from app.utils import setup_logging, to_iso_z, utc_now
 from app.worker.deal_matcher import (
+    DEAL_ENTRY_INOUT,
     DealMatcher,
     deal_from_mt5,
     order_from_mt5,
@@ -46,7 +47,9 @@ from app.worker.mt5_client import (
     MT5ConnectionError,
     MT5ServerUnreachableError,
     PositionSnapshot,
+    position_from_persist,
     position_to_event_dict,
+    position_to_persist,
 )
 
 logger = logging.getLogger("worker")
@@ -125,6 +128,15 @@ class Worker:
         self._sl_tp: dict[int, tuple[float | None, float | None]] = {}
         self._pending_closed: set[int] = set()
         self._state_path = self._resolve_state_path()
+        # Si el arranque encontró estado propio, el sembrado del historial no
+        # puede dar por enviado lo que cerró mientras este Worker no estaba.
+        self._tenia_estado_previo = False
+        # Ciclos de sondeo seguidos con error antes de declarar el slot en
+        # error. Tres deja margen a un fallo transitorio del terminal.
+        self._fallos_seguidos = 0
+        self._FALLOS_PARA_ERROR = 3
+        # Tickets de reverso ya avisados, para no repetir el aviso en cada poll.
+        self._reversos_avisados: set[int] = set()
 
         self._last_runtime_status = "connecting"
         self._next_account = 0.0
@@ -204,7 +216,7 @@ class Worker:
 
     def _bootstrap_history(self) -> None:
         deals = self._pull_deals()
-        self.matcher.ingest(deals)
+        frescos = self.matcher.ingest(deals)
         already_closed = self.matcher.snapshot_closed_ids()
         if self.replay_history_on_connect:
             # Las órdenes hacen falta AQUÍ más que en ningún otro sitio: estos
@@ -218,27 +230,46 @@ class Worker:
                 self._emit_trade(trade)
             logger.info("replay de %s trades cerrados del lookback", len(trades))
         else:
-            # Sembrar para no spamear al Core con historial viejo.
-            self.matcher.mark_emitted(already_closed)
+            # Sembrar para no spamear al Core con historial viejo, PERO sin
+            # tachar lo que se cerró mientras este Worker no estaba. En un
+            # arranque con estado previo, una posición con deals nuevos es
+            # justo la que cerró durante la caída: marcarla la perdería para
+            # siempre, porque nadie la vuelve a mirar. En un primer arranque
+            # no hay nada que preservar y todo el lookback es historial viejo.
+            a_marcar = already_closed
+            if self._tenia_estado_previo:
+                pids_frescos = {d.position_id for d in frescos}
+                a_marcar = [p for p in already_closed if p not in pids_frescos]
+            self.matcher.mark_emitted(a_marcar)
             logger.info(
-                "historial sembrado: %s deals, %s posiciones cerradas marcadas (sin emitir)",
+                "historial sembrado: %s deals, %s de %s posiciones cerradas "
+                "marcadas (sin emitir); %s se emitirán por haber cerrado "
+                "durante la parada",
                 len(deals),
+                len(a_marcar),
                 len(already_closed),
+                len(already_closed) - len(a_marcar),
             )
         self._save_persist()
 
-        # Snapshot inicial de posiciones abiertas (sin position.opened de más:
-        # sí emitimos opened para que el Core tenga el libro actual).
-        for pos in self.client.positions():
-            self._remember_sl_tp(pos)
-            if self._emit_position("position.opened", pos):
-                self._positions[pos.ticket] = pos
-            else:
-                # Sin registrarla, el primer poll la reemite.
-                logger.warning(
-                    "position.opened %s no aceptada al arrancar; se reintentará",
-                    pos.ticket,
-                )
+        if self._positions:
+            # Con libro recuperado, el trabajo es exactamente el de un poll:
+            # abrir las nuevas, actualizar las que cambiaron y CERRAR las que
+            # ya no están. Reemitir `opened` de todas mandaría duplicados al
+            # Core y, peor, se saltaría los cierres ocurridos durante la parada.
+            self._poll_positions()
+        else:
+            # Primer arranque: emitimos opened para que el Core tenga el libro.
+            for pos in self.client.positions():
+                self._remember_sl_tp(pos)
+                if self._emit_position("position.opened", pos):
+                    self._positions[pos.ticket] = pos
+                else:
+                    # Sin registrarla, el primer poll la reemite.
+                    logger.warning(
+                        "position.opened %s no aceptada al arrancar; se reintentará",
+                        pos.ticket,
+                    )
         self._poll_account(force=True)
 
     def _loop(self) -> None:
@@ -246,23 +277,46 @@ class Worker:
         while self._running:
             now = time.monotonic()
             try:
+                # Cada sondeo va aislado y su vencimiento avanza SIEMPRE. Con
+                # un solo try compartido, un fallo en el primero dejaba a los
+                # otros dos sin ejecutarse nunca (la cuenta dejaba de mandar
+                # snapshots) y reintentaba el fallido a 4 Hz, porque su marca
+                # de vencimiento tampoco avanzaba.
                 if now >= self._next_positions:
-                    self._poll_positions()
-                    self._next_positions = now + self.poll_positions_sec
+                    try:
+                        self._poll_positions()
+                    finally:
+                        self._next_positions = now + self.poll_positions_sec
                 if now >= self._next_history:
-                    self._poll_history()
-                    self._next_history = now + self.poll_history_sec
+                    try:
+                        self._poll_history()
+                    finally:
+                        self._next_history = now + self.poll_history_sec
                 if now >= self._next_account:
-                    self._poll_account()
-                    self._next_account = now + self.poll_account_sec
+                    try:
+                        self._poll_account()
+                    finally:
+                        self._next_account = now + self.poll_account_sec
+                self._fallos_seguidos = 0
             except MT5ConnectionError as exc:
                 logger.warning("desconexión MT5: %s", exc)
                 self._status("reconnecting", str(exc))
                 self.client.shutdown()
                 if not self._login_with_retries():
                     break
+                self._fallos_seguidos = 0
             except Exception:
                 logger.exception("error en poll")
+                self._fallos_seguidos += 1
+                # Un slot que lleva fallando todos los ciclos no puede seguir
+                # publicándose como 'connected': desde fuera parecía sano
+                # mientras no mandaba ni un dato.
+                if self._fallos_seguidos == self._FALLOS_PARA_ERROR:
+                    self._write_runtime("error")
+                    self._status(
+                        "error",
+                        f"{self._fallos_seguidos} ciclos de sondeo seguidos con error",
+                    )
             time.sleep(0.25)
 
     def _poll_positions(self) -> None:
@@ -357,13 +411,49 @@ class Worker:
         self._emit("account.snapshot", data.to_payload())
         _ = force
 
+    def _avisar_si_hay_reverso(self, deals: list) -> None:
+        """Grita si aparece un deal de reverso (DEAL_ENTRY_INOUT).
+
+        El emparejador cuenta ese deal solo como salida, así que la exposición
+        que ese mismo deal ABRE no vuelve a producir un trade.closed: la
+        operación se pierde en silencio. Arreglarlo bien exige rediseñar el
+        emparejador, y solo ocurre en cuentas *netting*; los challenges de
+        prop-firm son hedging y no los generan.
+
+        Mientras tanto, esto convierte una pérdida silenciosa en un aviso
+        visible: si algún día entra una cuenta netting, se sabe.
+        """
+        reversos = [d for d in deals if d.entry == DEAL_ENTRY_INOUT]
+        if not reversos:
+            return
+        nuevos = {d.ticket for d in reversos} - self._reversos_avisados
+        if not nuevos:
+            return
+        self._reversos_avisados |= nuevos
+        logger.error(
+            "CUENTA NETTING: %s deal(s) de reverso (DEAL_ENTRY_INOUT), tickets %s. "
+            "El emparejador no soporta este caso: la operación que abre el "
+            "reverso NO generará trade.closed. Revisa el histórico de esta "
+            "cuenta a mano y avisa para tratarlo.",
+            len(nuevos),
+            sorted(nuevos),
+        )
+
     def _pull_deals(self) -> list:
         raw = self.client.history_deals(self.history_lookback_days)
         parsed = []
         for item in raw:
-            deal = deal_from_mt5(item)
+            # Una fila ilegible del bróker no puede tirar el lote entero, como
+            # ya hace _pull_orders: perder un deal es malo, perder todos los
+            # del ciclo lo es mucho más.
+            try:
+                deal = deal_from_mt5(item)
+            except Exception:  # noqa: BLE001
+                logger.warning("deal ilegible; se omite", exc_info=True)
+                continue
             if deal is not None:
                 parsed.append(deal)
+        self._avisar_si_hay_reverso(parsed)
         return parsed
 
     def _pull_orders(self) -> dict:
@@ -544,9 +634,35 @@ class Worker:
 
         try:
             self.matcher.load_persist(payload.get("matcher") or {})
+            self._tenia_estado_previo = True
             logger.info("estado local cargado: %s", self._state_path)
         except Exception:
             logger.exception("no se pudo aplicar %s", self._state_path)
+            return
+
+        # El libro de posiciones abiertas también se rehidrata: si no, tras un
+        # reinicio `_poll_positions` compara contra un libro vacío y una
+        # posición que se cerró durante la parada nunca genera position.closed.
+        recuperadas = 0
+        for item in (payload.get("positions") or {}).values():
+            try:
+                pos = position_from_persist(item)
+            except Exception:
+                logger.warning("posición guardada ilegible; se ignora", exc_info=True)
+                continue
+            self._positions[pos.ticket] = pos
+            recuperadas += 1
+        for ticket in payload.get("pending_closed") or []:
+            try:
+                self._pending_closed.add(int(ticket))
+            except (TypeError, ValueError):
+                continue
+        if recuperadas or self._pending_closed:
+            logger.info(
+                "libro recuperado: %s posiciones abiertas, %s cierres pendientes",
+                recuperadas,
+                len(self._pending_closed),
+            )
 
     def _save_persist(self) -> None:
         try:
@@ -556,6 +672,11 @@ class Worker:
                         "account_id": self.account_id,
                         "mt5_login": self.mt5_login,
                         "matcher": self.matcher.dump_persist(),
+                        "positions": {
+                            str(ticket): position_to_persist(pos)
+                            for ticket, pos in self._positions.items()
+                        },
+                        "pending_closed": sorted(self._pending_closed),
                     }
                 ),
                 encoding="utf-8",

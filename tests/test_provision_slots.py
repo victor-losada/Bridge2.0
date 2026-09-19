@@ -220,3 +220,57 @@ def test_un_slot_dentro_de_la_plantilla_no_se_clona(tmp_path: Path) -> None:
     assert not (slot / "Slot-04").exists()
     # Y lo que sí queremos sigue estando.
     assert (slot / "config" / "servers.dat").is_file()
+
+
+def test_parar_un_slot_no_alcanza_a_otro_con_nombre_parecido(tmp_path: Path) -> None:
+    """Regresión: la pertenencia se decidía por prefijo de cadena, sin separador.
+
+    `.../terminals/Slot-1` es prefijo de `.../terminals/Slot-10`, y de cualquier
+    carpeta dejada al lado (`Slot-01.bak`, típica donde los slots se clonan de
+    una plantilla). Parar un slot mataba el terminal de otra cuenta.
+    """
+    from app.utils import ruta_dentro_de
+
+    raiz = (tmp_path / "terminals" / "Slot-1").resolve()
+    raiz_s = str(raiz).lower()
+
+    propio = raiz / "terminal64.exe"
+    ajeno_numerado = (tmp_path / "terminals" / "Slot-10" / "terminal64.exe").resolve()
+    ajeno_sufijo = (tmp_path / "terminals" / "Slot-1.bak" / "terminal64.exe").resolve()
+
+    assert ruta_dentro_de(str(propio), raiz_s) is True
+    assert ruta_dentro_de(str(ajeno_numerado), raiz_s) is False, "mató otro slot"
+    assert ruta_dentro_de(str(ajeno_sufijo), raiz_s) is False, "mató una copia vecina"
+    assert ruta_dentro_de(None, raiz_s) is False
+    assert ruta_dentro_de("", raiz_s) is False
+
+
+def test_la_poda_no_borra_copias_que_no_creo_ella(tmp_path: Path) -> None:
+    """Regresión: bastaba crear una carpeta señuelo para tirar las copias buenas.
+
+    La retención elegía qué destruir ordenando por nombre lo que encontraba en
+    el destino. Una carpeta vacía llamada `bridge-backup-9999...` empujaba a
+    todas las copias legítimas fuera de las `keep` más recientes.
+    """
+    from app.tools.backup import REGISTRO, anotar, poda
+
+    dest = tmp_path / "copias"
+    dest.mkdir()
+    legitimas = []
+    for marca in ("20260829-0300", "20260830-0300"):
+        carpeta = dest / f"bridge-backup-{marca}"
+        carpeta.mkdir()
+        (carpeta / ".env").write_text("FERNET_KEY=falsa", encoding="utf-8")
+        anotar(dest, carpeta)
+        legitimas.append(carpeta)
+
+    senuelo = dest / "bridge-backup-99991231-2359"
+    senuelo.mkdir()  # vacía: nadie escribió un byte dentro
+
+    borradas = poda(dest, keep=2)
+
+    assert borradas == [], "la poda borró copias legítimas por culpa del señuelo"
+    for carpeta in legitimas:
+        assert carpeta.is_dir(), f"{carpeta.name} desapareció"
+    assert senuelo.is_dir(), "tampoco debe borrar lo ajeno"
+    assert (dest / REGISTRO).is_file()

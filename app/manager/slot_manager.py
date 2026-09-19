@@ -117,6 +117,16 @@ class SlotManager:
                 return state
         return None
 
+    def find_all_by_account(self, account_id: str) -> list[SlotState]:
+        """Todos los slots con esa cuenta, no solo el primero.
+
+        Nada garantiza la unicidad cuenta → slot: reconectar una cuenta cuyo
+        slot quedó en ERROR le asigna un segundo slot. Desvincular tiene que
+        barrer el pool entero o dejaría viva una asignación con la contraseña
+        cifrada del cliente dentro.
+        """
+        return [s for s in self.slots.values() if s.account_id == account_id]
+
     async def connect(
         self,
         *,
@@ -128,11 +138,23 @@ class SlotManager:
         slot_id: str | None = None,
     ) -> SlotState:
         async with self._lock:
-            existing = self.find_by_account(account_id)
-            if existing and existing.status in {SlotStatus.CONNECTED, SlotStatus.CONNECTING}:
+            previos = self.find_all_by_account(account_id)
+            vivos = [
+                s
+                for s in previos
+                if s.status in {SlotStatus.CONNECTED, SlotStatus.CONNECTING}
+            ]
+            if vivos:
                 raise SlotManagerError(
-                    f"account_id {account_id} ya está en {existing.slot_id}"
+                    f"account_id {account_id} ya está en {vivos[0].slot_id}"
                 )
+            # Una asignación previa en ERROR o DISCONNECTED no se abandona: si
+            # no se reclama aquí, _pick_slot elige otro slot (solo mira los
+            # FREE) y la cuenta queda en dos a la vez. Una desvinculación
+            # posterior liberaría uno solo y el otro conservaría la contraseña
+            # cifrada del cliente, lista para relogar al reiniciar el Manager.
+            for previo in previos:
+                self._reclamar(previo)
 
             state = self._pick_slot(slot_id, mt5_server)
             if not self.terminal_ready(state.slot_id):
@@ -161,34 +183,48 @@ class SlotManager:
 
     async def disconnect(
         self, *, account_id: str | None = None, slot_id: str | None = None
-    ) -> SlotState | None:
-        """Desconecta y libera el slot.
+    ) -> list[SlotState]:
+        """Desconecta y libera TODOS los slots de esa cuenta.
 
-        Devuelve None si la cuenta no estaba en ningún slot. Desvincular es
-        una orden de estado final ("que no esté conectada"), no una operación
-        sobre un recurso: si ya se cumple, no es un error. El Manager guarda
-        los slots en memoria, así que tras reiniciarlo el Core pide desvincular
-        cuentas que aquí ya no existen — y eso no puede dejar al Core sin poder
-        desvincular nada.
+        Devuelve la lista de slots liberados; vacía si la cuenta no estaba en
+        ninguno. Desvincular es una orden de estado final ("que no esté
+        conectada"), no una operación sobre un recurso: si ya se cumple, no es
+        un error. El Manager guarda los slots en memoria, así que tras
+        reiniciarlo el Core pide desvincular cuentas que aquí ya no existen — y
+        eso no puede dejar al Core sin poder desvincular nada.
+
+        Barre el pool entero a propósito: una cuenta puede estar asignada a más
+        de un slot, y liberar solo el primero dejaría el otro con la sesión MT5
+        viva o con la contraseña cifrada en slots.json.
         """
         async with self._lock:
-            state: SlotState | None = None
+            objetivos: list[SlotState] = []
             if slot_id:
-                state = self.get_slot(slot_id)  # slot inexistente sí es error
+                objetivos = [self.get_slot(slot_id)]  # slot inexistente sí es error
             elif account_id:
-                state = self.find_by_account(account_id)
-            if state is None:
+                objetivos = self.find_all_by_account(account_id)
+            if not objetivos:
                 logger.info("desconectar: %s no estaba en ningún slot", account_id)
-                return None
-            self.proc.stop_slot(state.slot_id, self.slot_dir(state.slot_id))
-            state.status = SlotStatus.DISCONNECTED
-            state.touch()
-            # Liberar el slot para reutilizarlo.
-            freed = state.slot_id
-            state.reset_assignment()
+                return []
+            liberados: list[SlotState] = []
+            for state in objetivos:
+                self._reclamar(state)
+                liberados.append(self.slots[state.slot_id])
             self._save_assignments()
-            logger.info("%s liberado", freed)
-            return self.slots[freed]
+            logger.info("liberados: %s", ", ".join(s.slot_id for s in liberados))
+            return liberados
+
+    def _reclamar(self, state: SlotState) -> None:
+        """Para el Worker del slot y borra su asignación, sin guardar en disco.
+
+        Lo separa de `disconnect` porque `connect` también lo necesita, y
+        porque quien llama decide cuándo persistir: un solo `_save_assignments`
+        al final en vez de uno por slot.
+        """
+        self.proc.stop_slot(state.slot_id, self.slot_dir(state.slot_id))
+        state.status = SlotStatus.DISCONNECTED
+        state.touch()
+        state.reset_assignment()
 
     async def restart(self, slot_id: str) -> SlotState:
         async with self._lock:

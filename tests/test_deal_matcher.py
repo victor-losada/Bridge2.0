@@ -222,3 +222,43 @@ def test_order_from_mt5_ignora_una_orden_sin_ticket():
         tp = 2.0
 
     assert order_from_mt5(_Falsa()) is None
+
+
+def test_el_estado_persistido_no_impide_reconstruir_el_buffer():
+    """Regresión: una posición abierta a caballo de un reinicio del Worker.
+
+    `_by_position` no se persiste y MT5 reentrega la ventana entera en cada
+    poll. Si el descarte por ticket se hiciera antes de escribir en el bucket,
+    los deals de entrada guardados en `worker_state.json` nunca volverían al
+    buffer y el `trade.closed` de esa operación no saldría jamás.
+    """
+    entrada = _deal(ticket=1, entry=DEAL_ENTRY_IN, volume=0.10, time=_t(0))
+
+    # Sesión 1: el Worker ve la entrada y guarda su estado.
+    antes = DealMatcher()
+    antes.ingest([entrada])
+    assert antes.pop_ready_trades() == []  # sigue abierta
+    persistido = antes.dump_persist()
+    assert 1 in persistido["tickets"]
+
+    # Sesión 2: proceso nuevo. El buffer nace vacío; solo vuelve el estado.
+    despues = DealMatcher()
+    despues.load_persist(persistido)
+
+    # MT5 reentrega la ventana completa: la misma entrada más la salida nueva.
+    salida = _deal(
+        ticket=2,
+        entry=DEAL_ENTRY_OUT,
+        deal_type=DEAL_TYPE_SELL,
+        volume=0.10,
+        price=1.08750,
+        profit=22.70,
+        time=_t(30),
+    )
+    fresh = despues.ingest([entrada, salida])
+    assert [d.ticket for d in fresh] == [2], "la entrada ya era conocida"
+
+    trades = despues.pop_ready_trades()
+    assert len(trades) == 1, "el cierre tiene que emitirse tras el reinicio"
+    assert trades[0].position_id == entrada.position_id
+    assert trades[0].volume == 0.10

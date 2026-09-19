@@ -248,3 +248,56 @@ async def test_un_slots_json_con_bom_se_lee_igual(tmp_path: Path) -> None:
 
     assert len(spawned) == 1
     assert reiniciado.find_by_account("uuid-nys") is not None
+
+
+async def test_desvincular_libera_todas_las_asignaciones_de_la_cuenta(
+    tmp_path: Path,
+) -> None:
+    """Regresión: una cuenta puede acabar en dos slots y desvincular liberaba uno.
+
+    La guarda de `connect` solo rechazaba CONNECTED/CONNECTING, y `_pick_slot`
+    solo reutiliza slots FREE: reconectar una cuenta cuyo slot quedó en ERROR
+    le asignaba un segundo slot. `disconnect` resolvía con `find_by_account`,
+    que retorna en la primera coincidencia, así que la otra asignación sobrevivía
+    entera —con `password_encrypted` dentro y escrita en slots.json— lista para
+    descifrarse y relogar en el siguiente arranque del Manager.
+    """
+    spawned: list = []
+    manager = await _manager(tmp_path, spawned)
+
+    primero = await manager.connect(
+        account_id="uuid-nys",
+        mt5_login=203395,
+        mt5_password="secreta",
+        mt5_server="NYSMarketsLtd-trade",
+        investor=False,
+    )
+    # El login falla y el watchdog agota los reintentos: el slot queda en ERROR
+    # con la cuenta todavía asignada.
+    primero.status = SlotStatus.ERROR
+    primero.last_error = "login rechazado"
+
+    # El Core reconecta la misma cuenta. Antes esto creaba una segunda asignación.
+    segundo = await manager.connect(
+        account_id="uuid-nys",
+        mt5_login=203395,
+        mt5_password="secreta",
+        mt5_server="NYSMarketsLtd-trade",
+        investor=False,
+    )
+
+    # Una sola desvinculación tiene que dejar la cuenta fuera de TODO el pool.
+    await manager.disconnect(account_id="uuid-nys")
+
+    restantes = manager.find_all_by_account("uuid-nys")
+    assert restantes == [], f"la cuenta sigue en {[s.slot_id for s in restantes]}"
+    for state in manager.slots.values():
+        assert state.password_encrypted is None, f"{state.slot_id} conserva la clave"
+
+    guardado = json.loads((tmp_path / "data" / "slots.json").read_text())
+    assert not [
+        item
+        for item in guardado["slots"]
+        if item.get("account_id") == "uuid-nys"
+    ], "slots.json aún tiene la cuenta desvinculada"
+    assert segundo.slot_id  # el segundo connect devolvió un slot válido

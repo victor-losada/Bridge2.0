@@ -330,16 +330,25 @@ class DealMatcher:
             self._emitted.discard(int(pid))
 
     def ingest(self, deals: Iterable[RawDeal]) -> list[RawDeal]:
-        """Añade deals nuevos. Devuelve los que no se habían visto."""
+        """Añade deals nuevos. Devuelve los que no se habían visto.
+
+        El buffer se repuebla SIEMPRE, incluso con deals ya conocidos:
+        `_by_position` no se persiste y MT5 reentrega la ventana entera en
+        cada poll. Si el descarte por ticket fuese antes de escribir en el
+        bucket, una posición abierta a caballo de un reinicio del Worker
+        perdería sus deals de entrada para siempre y su trade.closed no
+        saldría jamás. `_known_tickets` sirve solo para decidir qué deals son
+        nuevos; quien impide reemitir es `_emitted`.
+        """
         fresh: list[RawDeal] = []
         for deal in deals:
             if not deal.is_market_deal:
                 continue
+            bucket = self._by_position.setdefault(deal.position_id, {})
+            bucket[deal.ticket] = deal
             if deal.ticket in self._known_tickets:
                 continue
             self._known_tickets.add(deal.ticket)
-            bucket = self._by_position.setdefault(deal.position_id, {})
-            bucket[deal.ticket] = deal
             fresh.append(deal)
         return fresh
 

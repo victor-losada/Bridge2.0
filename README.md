@@ -662,8 +662,15 @@ CORE_EVENTS_URL=http://127.0.0.1:8088/api/v1/debug/events
 | GET | `/api/v1/slots` | Pool |x|
 | GET | `/api/v1/slots/{id}` | Detalle |
 | POST | `/api/v1/accounts/connect` | Asigna slot y arranca Worker |
-| POST | `/api/v1/accounts/disconnect` | Mata Worker + terminal, libera slot (idempotente) |
+| POST | `/api/v1/accounts/disconnect` | Mata Worker + terminal, libera **todos** los slots de la cuenta (idempotente) |
 | POST | `/api/v1/slots/{id}/restart` | Reinicio limpio |
 | POST | `/api/v1/core-ping` | Diagnóstico del canal Bridge → Core |
 
 Todas las rutas salvo `health` requieren `X-API-Key` o `Authorization: Bearer`.
+
+La respuesta de `accounts/disconnect` lleva `slot` (el primero liberado, por
+compatibilidad) y `slots` (la lista completa). Una cuenta puede ocupar más de
+un slot: si su slot queda en `error` y el Core la reconecta, `connect` reclama
+la asignación anterior antes de dar una nueva, y `disconnect` barre el pool
+entero. Comprobar `slots` es la forma de verificar que no quedó ninguna.
+

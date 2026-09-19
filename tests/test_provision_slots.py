@@ -120,7 +120,7 @@ async def test_desconectar_una_cuenta_que_no_esta_no_es_error(tmp_path: Path) ->
     await manager.start()
     manager._watch_task.cancel()
 
-    assert await manager.disconnect(account_id="uuid-que-no-esta") is None
+    assert await manager.disconnect(account_id="uuid-que-no-esta") == []
 
 
 # --- Afinidad de bróker ------------------------------------------------------

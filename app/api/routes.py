@@ -119,17 +119,28 @@ async def disconnect_account(body: DisconnectAccountRequest, request: Request) -
     if not body.account_id and not body.slot_id:
         raise HTTPException(400, "indica account_id o slot_id")
     try:
-        state = await mgr.disconnect(account_id=body.account_id, slot_id=body.slot_id)
+        liberados = await mgr.disconnect(
+            account_id=body.account_id, slot_id=body.slot_id
+        )
     except SlotManagerError as exc:
         raise HTTPException(404, str(exc)) from exc
-    if state is None:
+    if not liberados:
         return {
             "ok": True,
             "already_disconnected": True,
             "detail": f"{body.account_id} no estaba conectada",
             "slot": None,
+            "slots": [],
         }
-    return {"ok": True, "already_disconnected": False, "slot": state.public_dict()}
+    # `slot` se mantiene por compatibilidad con el Core, que ya lo lee. `slots`
+    # es la lista completa: una cuenta puede ocupar más de un slot y el Core
+    # necesita poder comprobar que se liberaron todos.
+    return {
+        "ok": True,
+        "already_disconnected": False,
+        "slot": liberados[0].public_dict(),
+        "slots": [s.public_dict() for s in liberados],
+    }
 
 
 @router.post("/accounts/{account_id}/disconnect", dependencies=[Depends(require_key)])

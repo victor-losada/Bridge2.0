@@ -45,6 +45,13 @@ def _url_configurada() -> str:
 #: siendo el destino de unas credenciales.
 _ACCESO = re.compile(r"^[A-Za-z0-9._-]{1,253}:\d{1,5}$")
 
+#: Un nombre de host pelado, sin puerto. MT5 también los acepta como destino:
+#: `mt5-pro.roboforex.com` conecta igual de bien que `RoboForex-Pro`. Lo que
+#: distingue a un host de un NOMBRE de servidor es el punto: los nombres de
+#: MetaQuotes son del estilo `RoboForex-Pro`, `FTMO-Server4` o
+#: `Exness-MT5Real11` — llevan guiones, nunca puntos.
+_HOST = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$")
+
 
 def _pedir(url: str, nombre: str, timeout: float) -> object:
     with httpx.Client(timeout=timeout, trust_env=False) as cliente:
@@ -119,5 +126,21 @@ def puntos_de_acceso(
 
 
 def parece_direccion(server: str) -> bool:
-    """True si ya es `host:puerto` y no un nombre de servidor."""
-    return bool(_ACCESO.match(server.strip()))
+    """True si es una DIRECCIÓN (host:puerto o host) y no un nombre de servidor.
+
+    Importa porque de esto depende si se comprueba la identidad del servidor
+    tras el login. Con un nombre (`RoboForex-Pro`) el servidor devuelve ese
+    mismo nombre y la comparación tiene sentido. Con una dirección no: el
+    servidor contesta con SU nombre canónico, que no tiene por qué parecerse al
+    host que escribimos, y comparar los dos rechaza conexiones perfectamente
+    buenas.
+
+    El puerto no puede ser el criterio: `mt5-pro.roboforex.com` es una
+    dirección tan válida como `mt5-pro.roboforex.com:443`, y tratarla como
+    nombre dejaba el slot en error con el login ya hecho.
+    """
+    valor = server.strip()
+    if _ACCESO.match(valor):
+        return True
+    host = valor.rsplit(":", 1)[0] if _ACCESO.match(valor) else valor
+    return bool(_HOST.match(host))

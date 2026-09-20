@@ -403,3 +403,48 @@ async def test_el_ciclo_del_watchdog_no_muere_por_una_excepcion(tmp_path: Path) 
     assert not tarea.done(), "el watchdog murió con la primera excepción"
     assert fallos["n"] >= 2, "el ciclo dejó de intentarlo"
     tarea.cancel()
+
+
+async def test_solo_un_veredicto_del_broker_corta_el_reintento(tmp_path: Path) -> None:
+    """Regresión: un fallo de login transitorio se anunciaba como rechazo.
+
+    El Worker salía con 2 en TRES casos distintos (credenciales rechazadas,
+    servidor inalcanzable y cualquier otro fallo tras agotar reintentos), y el
+    watchdog trataba los tres como veredicto del bróker: el slot quedaba en
+    error sin un solo reintento y con un mensaje que culpaba al cliente.
+    """
+    from app.worker.worker import (
+        EXIT_CREDENCIALES,
+        EXIT_LOGIN_FALLIDO,
+        EXIT_SERVIDOR,
+    )
+
+    async def _un_ciclo(salida: int) -> tuple[SlotStatus, str | None, int]:
+        spawned: list = []
+        manager = await _manager(tmp_path / str(salida), spawned)
+        estado = manager.slots["Slot-01"]
+        estado.account_id = "uuid-x"
+        estado.mt5_login = 1
+        estado.mt5_server = "Broker"
+        estado.password_encrypted = manager.cipher.encrypt("secreta")
+        estado.status = SlotStatus.CONNECTING
+        manager.proc.is_running = lambda slot_id: False  # type: ignore[method-assign]
+        manager.proc.exit_code = lambda slot_id: salida  # type: ignore[method-assign]
+        await manager._watch_once()
+        return estado.status, estado.last_error, estado.restart_count
+
+    # El bróker dijo que no: se corta, y el mensaje dice la verdad.
+    status, error, reintentos = await _un_ciclo(EXIT_CREDENCIALES)
+    assert status == SlotStatus.ERROR
+    assert "credenciales" in error
+    assert reintentos == 0
+
+    # Servidor inalcanzable: también se corta, con SU motivo.
+    status, error, _ = await _un_ciclo(EXIT_SERVIDOR)
+    assert status == SlotStatus.ERROR
+    assert "alcanzable" in error
+
+    # Fallo genérico de login: esto SÍ se reintenta, como antes.
+    status, error, reintentos = await _un_ciclo(EXIT_LOGIN_FALLIDO)
+    assert reintentos == 1, "un fallo transitorio tiene que reintentarse"
+    assert status != SlotStatus.ERROR

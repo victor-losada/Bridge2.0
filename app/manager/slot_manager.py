@@ -26,10 +26,16 @@ logger = logging.getLogger(__name__)
 
 _CORE_CHANNEL_PREFIX = "el Core no acepta eventos: "
 
-# Código con el que el Worker sale cuando el bróker rechazó las credenciales
-# (app/worker/worker.py:run). Es un veredicto del servidor, no un fallo
-# transitorio: relanzarlo solo arriesga el bloqueo de la cuenta.
-EXIT_CREDENCIALES = 2
+# Códigos de salida del Worker que son un VEREDICTO y no un fallo transitorio:
+# relanzarlo no cambia el resultado. Los demás (incluido un login que falló por
+# un timeout) sí se reintentan, como siempre.
+#
+# Tienen que coincidir con app/worker/worker.py. El 2 genérico NO está aquí a
+# propósito: es "el login no prosperó", que puede ser perfectamente transitorio.
+SALIDAS_DEFINITIVAS = {
+    3: "el bróker rechazó las credenciales",
+    4: "el servidor del bróker no es alcanzable",
+}
 
 
 class SlotManagerError(RuntimeError):
@@ -501,14 +507,16 @@ class SlotManager:
                         continue
                     if state.status in {SlotStatus.DISCONNECTED, SlotStatus.ERROR}:
                         continue
-                    if self.proc.exit_code(state.slot_id) == EXIT_CREDENCIALES:
-                        # El bróker dijo que no. Relanzar no cambia el veredicto
-                        # y cada intento acerca la cuenta del cliente a un
-                        # bloqueo: el Worker ya corta por esto, pero su decisión
-                        # moría con el proceso.
+                    salida = self.proc.exit_code(state.slot_id)
+                    if salida in SALIDAS_DEFINITIVAS:
+                        # Veredicto del servidor, no un fallo transitorio:
+                        # relanzar no cambia el resultado y, en el caso de las
+                        # credenciales, cada intento acerca la cuenta del
+                        # cliente a un bloqueo. El Worker ya corta por esto,
+                        # pero su decisión moría con el proceso.
                         state.status = SlotStatus.ERROR
                         state.last_error = (
-                            "credenciales rechazadas por el bróker: no se reintenta"
+                            f"{SALIDAS_DEFINITIVAS[salida]}: no se reintenta"
                         )
                         state.touch()
                         logger.error("%s %s", state.slot_id, state.last_error)

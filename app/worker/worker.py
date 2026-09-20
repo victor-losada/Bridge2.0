@@ -54,6 +54,17 @@ from app.worker.mt5_client import (
 
 logger = logging.getLogger("worker")
 
+# Códigos de salida del proceso. El Manager los lee para decidir si relanzar:
+# un veredicto del servidor no se reintenta, un fallo transitorio sí. Antes
+# todos los fallos de login salían con el mismo 2 y el Manager no podía
+# distinguirlos, de modo que un timeout puntual se anunciaba como "credenciales
+# rechazadas" y el slot quedaba en error sin un solo reintento.
+EXIT_OK = 0
+EXIT_CRASH = 1
+EXIT_LOGIN_FALLIDO = 2       # genérico: reintentable
+EXIT_CREDENCIALES = 3        # el bróker contestó que no
+EXIT_SERVIDOR = 4            # el servidor del bróker no es alcanzable
+
 
 class Worker:
     def __init__(
@@ -137,6 +148,8 @@ class Worker:
         self._FALLOS_PARA_ERROR = 3
         # Tickets de reverso ya avisados, para no repetir el aviso en cada poll.
         self._reversos_avisados: set[int] = set()
+        # Con qué código sale el proceso si el login no prospera.
+        self._salida_login = EXIT_LOGIN_FALLIDO
 
         self._last_runtime_status = "connecting"
         self._next_account = 0.0
@@ -152,16 +165,16 @@ class Worker:
         self._load_persist()
         self._write_runtime("connecting")
         if not self._login_with_retries():
-            return 2
+            return self._salida_login
 
         try:
             self._bootstrap_history()
             self._loop()
-            return 0
+            return EXIT_OK
         except Exception:
             logger.exception("worker crash")
             self._status("error", "excepción no controlada en el worker")
-            return 1
+            return EXIT_CRASH
         finally:
             self._write_runtime("disconnected")
             self._status("disconnected", "worker detenido")
@@ -174,6 +187,7 @@ class Worker:
 
     def _login_with_retries(self) -> bool:
         self._status("connecting", "iniciando terminal portable y login")
+        self._salida_login = EXIT_LOGIN_FALLIDO
         last_err = "login fallido"
         for attempt in range(1, self.login_retry_max + 1):
             try:
@@ -191,6 +205,7 @@ class Worker:
                 # El servidor contestó que no. Reintentar no cambia el veredicto
                 # y arriesga que el bróker bloquee la cuenta.
                 logger.error("credenciales rechazadas: %s", exc)
+                self._salida_login = EXIT_CREDENCIALES
                 self._write_runtime("error")
                 self._status("error", f"credenciales_rechazadas: {exc}")
                 return False
@@ -199,6 +214,7 @@ class Worker:
                 # más de diez minutos con el slot ocupado. Se corta aquí y el
                 # Core recibe una causa sobre la que puede actuar.
                 logger.error("servidor inalcanzable: %s", exc)
+                self._salida_login = EXIT_SERVIDOR
                 self._write_runtime("error")
                 self._status("error", f"broker_desconocido: {exc}")
                 return False

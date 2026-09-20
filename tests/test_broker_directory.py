@@ -119,3 +119,40 @@ def test_el_directorio_se_puede_apuntar_a_otro_sitio(monkeypatch):
         "185.96.244.5:443",
     ]
     assert vistas == ["https://interno.example/buscar"]
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        "mt5-pro.roboforex.com",
+        "mt5-demo01.pepperstone.com",
+        "35.234.132.67",
+        "35.234.132.67:443",
+        "broker.ejemplo.com:1234",
+    ],
+)
+def test_un_host_sin_puerto_tambien_es_una_direccion(valor: str) -> None:
+    """Regresión: exigir puerto dejaba brókers buenos fuera.
+
+    MT5 acepta `mt5-pro.roboforex.com` como destino igual que `RoboForex-Pro`.
+    Al tratarlo como NOMBRE, la comprobación posterior comparaba el host con el
+    nombre canónico que devuelve el servidor, no coincidían nunca, y el slot
+    quedaba en error con el login ya hecho y la cuenta correctamente conectada.
+    """
+    assert parece_direccion(valor) is True
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        "RoboForex-Pro",
+        "FTMO-Server4",
+        "Exness-MT5Real11",
+        "NYSMarketsLtd-trade",
+        "ICMarketsSC-Demo",
+        "",
+    ],
+)
+def test_un_nombre_de_broker_no_es_una_direccion(valor: str) -> None:
+    """Y los nombres siguen siendo nombres: ahí la comprobación debe aplicarse."""
+    assert parece_direccion(valor) is False

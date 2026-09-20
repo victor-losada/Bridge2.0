@@ -202,7 +202,17 @@ class MT5Client:
         # que no era. Mejor cortar que seguir.
         esperado = server.strip()
         real = str(getattr(info, "server", "") or "").strip()
-        if not broker_directory.parece_direccion(esperado) and real and real.lower() != esperado.lower():
+        if broker_directory.parece_direccion(esperado):
+            # Se pidió una dirección, no un nombre: el servidor contesta con su
+            # nombre canónico, que no tiene por qué parecerse al host escrito,
+            # así que no hay nada que comparar. Queda en el log para que se
+            # pueda auditar a dónde fue a parar la credencial.
+            logger.info(
+                "conectado por dirección %r; el servidor dice llamarse %r",
+                esperado,
+                real or "(sin nombre)",
+            )
+        elif real and real.lower() != esperado.lower():
             mt5.shutdown()
             raise MT5ConnectionError(
                 f"Servidor inesperado: se pidió {esperado!r} y el terminal está "
